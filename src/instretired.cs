@@ -172,9 +172,10 @@ namespace CoreClrInstRetired
         public static void Main(string[] args)
         {
             string traceFile = args[0];
-            string benchmarkName = "corerun";
+            string benchmarkName = "dotnet";
             int benchmarkPid = -2;
 
+            Dictionary<string, uint> allEventCounts = new Dictionary<string, uint>();
             Dictionary<string, uint> eventCounts = new Dictionary<string, uint>();
             Dictionary<string, uint> processCounts = new Dictionary<string, uint>();
 
@@ -182,6 +183,15 @@ namespace CoreClrInstRetired
             {
                 source.Kernel.All += delegate (TraceEvent data)
                 {
+                    if (allEventCounts.ContainsKey(data.EventName))
+                    {
+                        allEventCounts[data.EventName]++;
+                    }
+                    else
+                    {
+                        allEventCounts[data.EventName] = 1;
+                    }
+
                     if (data.ProcessID == benchmarkPid)
                     {
                         if (eventCounts.ContainsKey(data.EventName))
@@ -197,12 +207,19 @@ namespace CoreClrInstRetired
                     switch (data.EventName)
                     {
                         case "Process/Start":
+                        case "Process/DCStart":
                             {
+                                // Process was running when tracing started (DCStart)
+                                // or started when tracing was running (Start)
                                 ProcessTraceData pdata = (ProcessTraceData)data;
                                 if (String.Equals(pdata.ProcessName, benchmarkName, StringComparison.OrdinalIgnoreCase))
                                 {
+                                    Console.WriteLine("Found process [{0}] {1}: {2}", pdata.ProcessID, pdata.ProcessName, pdata.CommandLine);
                                     benchmarkPid = pdata.ProcessID;
-
+                                }
+                                else
+                                {
+                                    // Console.WriteLine("Ignoring events from process {0}", pdata.ProcessName);
                                 }
                                 break;
                             }
@@ -213,7 +230,6 @@ namespace CoreClrInstRetired
 
                                 if (data.ProcessID == 0)
                                 {
-
                                     string fileName = imageLoadTraceData.FileName;
                                     ulong imageBase = imageLoadTraceData.ImageBase;
                                     int imageSize = imageLoadTraceData.ImageSize;
@@ -278,71 +294,83 @@ namespace CoreClrInstRetired
 
                 source.Clr.All += delegate (TraceEvent data)
                 {
-                    if (eventCounts.ContainsKey(data.EventName))
+                    if (allEventCounts.ContainsKey(data.EventName))
                     {
-                        eventCounts[data.EventName]++;
+                        allEventCounts[data.EventName]++;
                     }
                     else
                     {
-                        eventCounts[data.EventName] = 1;
+                        allEventCounts[data.EventName] = 1;
                     }
 
-                    switch(data.EventName)
+                    if (data.ProcessID == benchmarkPid)
                     {
-                        case "Method/JittingStarted":
-                            {
-                                MethodJittingStartedTraceData jitStartData = (MethodJittingStartedTraceData)data;
-                                JitInvocation jitInvocation = new JitInvocation();
-                                jitInvocation.ThreadId = jitStartData.ThreadID;
-                                jitInvocation.MethodId = jitStartData.MethodID;
-                                jitInvocation.InitialThreadCount = ThreadCountMap[jitInvocation.ThreadId];
-                                ActiveJitInvocations.Add(jitInvocation.ThreadId, jitInvocation);
-                                AllJitInvocations.Add(jitInvocation);
-                                break;
-                            }
-                        case "Method/LoadVerbose":
-                            {
-                                MethodLoadUnloadVerboseTraceData loadUnloadData = (MethodLoadUnloadVerboseTraceData)data;
-                                if (ActiveJitInvocations.ContainsKey(loadUnloadData.ThreadID))
+                        if (eventCounts.ContainsKey(data.EventName))
+                        {
+                            eventCounts[data.EventName]++;
+                        }
+                        else
+                        {
+                            eventCounts[data.EventName] = 1;
+                        }
+
+                        switch (data.EventName)
+                        {
+                            case "Method/JittingStarted":
                                 {
-                                    JitInvocation j = ActiveJitInvocations[loadUnloadData.ThreadID];
-                                    ActiveJitInvocations.Remove(j.ThreadId);
-                                    j.FinalThreadCount = ThreadCountMap[j.ThreadId];
-                                    if (j.FinalThreadCount < j.InitialThreadCount)
+                                    MethodJittingStartedTraceData jitStartData = (MethodJittingStartedTraceData)data;
+                                    JitInvocation jitInvocation = new JitInvocation();
+                                    jitInvocation.ThreadId = jitStartData.ThreadID;
+                                    jitInvocation.MethodId = jitStartData.MethodID;
+                                    jitInvocation.InitialThreadCount = ThreadCountMap[jitInvocation.ThreadId];
+                                    ActiveJitInvocations.Add(jitInvocation.ThreadId, jitInvocation);
+                                    AllJitInvocations.Add(jitInvocation);
+                                    break;
+                                }
+                            case "Method/LoadVerbose":
+                                {
+                                    MethodLoadUnloadVerboseTraceData loadUnloadData = (MethodLoadUnloadVerboseTraceData)data;
+                                    if (ActiveJitInvocations.ContainsKey(loadUnloadData.ThreadID))
                                     {
-                                        Console.WriteLine("eh? negative jit count...");
+                                        JitInvocation j = ActiveJitInvocations[loadUnloadData.ThreadID];
+                                        ActiveJitInvocations.Remove(j.ThreadId);
+                                        j.FinalThreadCount = ThreadCountMap[j.ThreadId];
+                                        if (j.FinalThreadCount < j.InitialThreadCount)
+                                        {
+                                            Console.WriteLine("eh? negative jit count...");
+                                        }
+                                        else
+                                        {
+                                            JitSampleCount += j.FinalThreadCount - j.InitialThreadCount;
+                                        }
                                     }
                                     else
                                     {
-                                        JitSampleCount += j.FinalThreadCount - j.InitialThreadCount;
+                                        // ?
                                     }
+                                    break;
                                 }
-                                else
+                            case "Method/UnloadVerbose":
                                 {
-                                    // ?
+                                    // Pretend this is an "image"
+                                    MethodLoadUnloadVerboseTraceData loadUnloadData = (MethodLoadUnloadVerboseTraceData)data;
+                                    string fullName = GetName(loadUnloadData);
+                                    string key = fullName + "@" + loadUnloadData.MethodID.ToString("X");
+                                    if (!ImageMap.ContainsKey(key))
+                                    {
+                                        ImageInfo methodInfo = new ImageInfo(fullName, loadUnloadData.MethodStartAddress,
+                                            loadUnloadData.MethodSize);
+                                        ImageMap.Add(key, methodInfo);
+                                        methodInfo.IsJitGeneratedCode = true;
+                                        methodInfo.IsJittedCode = loadUnloadData.IsJitted;
+                                    }
+                                    //else
+                                    //{
+                                    //    Console.WriteLine("eh? see method {0} again in rundown", fullName);
+                                    //}
+                                    break;
                                 }
-                                break;
-                            }
-                        case "Method/UnloadVerbose":
-                            {
-                                // Pretend this is an "image"
-                                MethodLoadUnloadVerboseTraceData loadUnloadData = (MethodLoadUnloadVerboseTraceData)data;
-                                string fullName = GetName(loadUnloadData);
-                                string key = fullName + "@" + loadUnloadData.MethodID.ToString("X");
-                                if (!ImageMap.ContainsKey(key))
-                                {
-                                    ImageInfo methodInfo = new ImageInfo(fullName, loadUnloadData.MethodStartAddress,
-                                        loadUnloadData.MethodSize);
-                                    ImageMap.Add(key, methodInfo);
-                                    methodInfo.IsJitGeneratedCode = true;
-                                    methodInfo.IsJittedCode = loadUnloadData.IsJitted;
-                                }
-                                //else
-                                //{
-                                //    Console.WriteLine("eh? see method {0} again in rundown", fullName);
-                                //}
-                                break;
-                            }
+                        }
                     }
                 };
 
@@ -352,7 +380,7 @@ namespace CoreClrInstRetired
 
             AttributeSampleCounts();
 
-            //foreach (var e in eventCounts)
+            //foreach (var e in allEventCounts)
             //{
             //    Console.WriteLine("Event {0} occurred {1} times", e.Key, e.Value);
             //}
@@ -361,49 +389,57 @@ namespace CoreClrInstRetired
             //    Console.WriteLine("Process {0} had {1} events", e.Key, e.Value);
             //}
 
-            ulong InstrsPerEvent = 65536;
-            ulong pmcEvents = eventCounts["PerfInfo/PMCSample"];
-
-            Console.WriteLine("InstRetired for {0}: {1} events, {2:E} instrs", 
-                benchmarkName, pmcEvents, pmcEvents * InstrsPerEvent);
-            Console.WriteLine("Jitting           : {0:00.00%} ({1} methods)", 
-                (double) JitSampleCount / TotalSampleCount, AllJitInvocations.Count);
-            // Console.WriteLine("  JitInterface    : {0:00.00%}", (double) JitSampleCount - JitDllSampleCount);
-            Console.WriteLine("Jit-generated code: {0:00.00%}", (double) JitGeneratedCodeSampleCount / TotalSampleCount);
-            Console.WriteLine("  Jitted code     : {0:00.00%}", (double) JittedCodeSampleCount / TotalSampleCount);
-            Console.WriteLine();
-
-            double ufrac = (double)UnknownImageCount / TotalSampleCount;
-            if (ufrac > 0.002)
+            if (!eventCounts.ContainsKey("PerfInfo/PMCSample"))
             {
-                Console.WriteLine("{0:00.00%}   {1,-8:G3}   {2} {3}", 
-                    ufrac,
-                    UnknownImageCount * InstrsPerEvent,
-                    "?      ",
-                    "Unknown");
+                Console.WriteLine("No PMC events seen, sorry.");
             }
-
-            // Collect up significant counts
-            List<ImageInfo> significantInfos = new List<ImageInfo>();
-
-            foreach (var i in ImageMap)
+            else
             {
-                double frac = (double)i.Value.SampleCount / TotalSampleCount;
-                if (frac > 0.002)
+
+                ulong InstrsPerEvent = 65536;
+                ulong pmcEvents = eventCounts["PerfInfo/PMCSample"];
+
+                Console.WriteLine("InstRetired for {0}: {1} events, {2:E} instrs",
+                    benchmarkName, pmcEvents, pmcEvents * InstrsPerEvent);
+                Console.WriteLine("Jitting           : {0:00.00%} ({1} methods)",
+                    (double)JitSampleCount / TotalSampleCount, AllJitInvocations.Count);
+                // Console.WriteLine("  JitInterface    : {0:00.00%}", (double) JitSampleCount - JitDllSampleCount);
+                Console.WriteLine("Jit-generated code: {0:00.00%}", (double)JitGeneratedCodeSampleCount / TotalSampleCount);
+                Console.WriteLine("  Jitted code     : {0:00.00%}", (double)JittedCodeSampleCount / TotalSampleCount);
+                Console.WriteLine();
+
+                double ufrac = (double)UnknownImageCount / TotalSampleCount;
+                if (ufrac > 0.002)
                 {
-                    significantInfos.Add(i.Value);
+                    Console.WriteLine("{0:00.00%}   {1,-8:G3}   {2} {3}",
+                        ufrac,
+                        UnknownImageCount * InstrsPerEvent,
+                        "?      ",
+                        "Unknown");
                 }
-            }
 
-            significantInfos.Sort(ImageInfo.MoreSamples);
+                // Collect up significant counts
+                List<ImageInfo> significantInfos = new List<ImageInfo>();
 
-            foreach (var i in significantInfos)
-            {
-                Console.WriteLine("{0:00.00%}   {1,-8:G3}   {2}  {3}",
-                    (double)i.SampleCount / TotalSampleCount,
-                    i.SampleCount * InstrsPerEvent,
-                    i.IsJitGeneratedCode ? (i.IsJittedCode ? "jit   " : "prejit") : "native",
-                    i.Name);
+                foreach (var i in ImageMap)
+                {
+                    double frac = (double)i.Value.SampleCount / TotalSampleCount;
+                    if (frac > 0.002)
+                    {
+                        significantInfos.Add(i.Value);
+                    }
+                }
+
+                significantInfos.Sort(ImageInfo.MoreSamples);
+
+                foreach (var i in significantInfos)
+                {
+                    Console.WriteLine("{0:00.00%}   {1,-8:G3}   {2}  {3}",
+                        (double)i.SampleCount / TotalSampleCount,
+                        i.SampleCount * InstrsPerEvent,
+                        i.IsJitGeneratedCode ? (i.IsJittedCode ? "jit   " : "prejit") : "native",
+                        i.Name);
+                }
             }
         }
     }
