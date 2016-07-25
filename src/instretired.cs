@@ -303,16 +303,23 @@ namespace CoreClrInstRetired
                         case "Method/LoadVerbose":
                             {
                                 MethodLoadUnloadVerboseTraceData loadUnloadData = (MethodLoadUnloadVerboseTraceData)data;
-                                JitInvocation j = ActiveJitInvocations[loadUnloadData.ThreadID];
-                                ActiveJitInvocations.Remove(j.ThreadId);
-                                j.FinalThreadCount = ThreadCountMap[j.ThreadId];
-                                if (j.FinalThreadCount < j.InitialThreadCount)
+                                if (ActiveJitInvocations.ContainsKey(loadUnloadData.ThreadID))
                                 {
-                                    Console.WriteLine("eh? negative jit count...");
+                                    JitInvocation j = ActiveJitInvocations[loadUnloadData.ThreadID];
+                                    ActiveJitInvocations.Remove(j.ThreadId);
+                                    j.FinalThreadCount = ThreadCountMap[j.ThreadId];
+                                    if (j.FinalThreadCount < j.InitialThreadCount)
+                                    {
+                                        Console.WriteLine("eh? negative jit count...");
+                                    }
+                                    else
+                                    {
+                                        JitSampleCount += j.FinalThreadCount - j.InitialThreadCount;
+                                    }
                                 }
                                 else
                                 {
-                                    JitSampleCount += j.FinalThreadCount - j.InitialThreadCount;
+                                    // ?
                                 }
                                 break;
                             }
