@@ -24,7 +24,7 @@ namespace CoreClrInstRetired
             Size = size;
             EndAddress = baseAddress + (uint)Size;
             SampleCount = 0;
-            IsJitGeneratedCode = false;      
+            IsJitGeneratedCode = false;
         }
 
         public static int LowerAddress(ImageInfo x, ImageInfo y)
@@ -73,6 +73,8 @@ namespace CoreClrInstRetired
         public static ulong JitGeneratedCodeSampleCount = 0;
         public static ulong JittedCodeSampleCount = 0;
         public static ulong UnknownImageCount = 0;
+        public static ulong JittedCodeSize = 0;
+        public static ulong ManagedMethodCount = 0;
 
         static void UpdateSampleCountMap(ulong address, ulong count)
         {
@@ -104,7 +106,7 @@ namespace CoreClrInstRetired
             int imageIndex = 0;
             ImageInfo image = imageArray[imageIndex];
 
-            foreach(ulong address in SampleCountMap.Keys)
+            foreach (ulong address in SampleCountMap.Keys)
             {
                 while ((imageIndex < imageArray.Length) && (address >= image.EndAddress))
                 {
@@ -169,11 +171,24 @@ namespace CoreClrInstRetired
             return className + sep + data.MethodName + sig;
         }
 
-        public static void Main(string[] args)
+        public static int Main(string[] args)
         {
+            if (args.Length != 1 && args.Length != 3)
+            {
+                Console.WriteLine("Usage: instretired file.etl [-process process-name]");
+                Console.WriteLine("   process defaults to corerun");
+                return -1;
+            }
+
             string traceFile = args[0];
-            string benchmarkName = "dotnet";
+            string benchmarkName = "corerun";
             int benchmarkPid = -2;
+            if (args.Length == 3)
+            {
+                benchmarkName = args[2];
+            }
+
+            Console.WriteLine("Mining ETL from {0} for process {1}", traceFile, benchmarkName);
 
             Dictionary<string, uint> allEventCounts = new Dictionary<string, uint>();
             Dictionary<string, uint> eventCounts = new Dictionary<string, uint>();
@@ -343,6 +358,9 @@ namespace CoreClrInstRetired
                                         {
                                             JitSampleCount += j.FinalThreadCount - j.InitialThreadCount;
                                         }
+
+                                        ManagedMethodCount++;
+                                        JittedCodeSize += (ulong)loadUnloadData.MethodExtent;
                                     }
                                     else
                                     {
@@ -350,7 +368,14 @@ namespace CoreClrInstRetired
                                     }
                                     break;
                                 }
-                            case "Method/UnloadVerbose":
+                            }
+                        case "Method/UnloadVerbose":
+                            {
+                                // Pretend this is an "image"
+                                MethodLoadUnloadVerboseTraceData loadUnloadData = (MethodLoadUnloadVerboseTraceData)data;
+                                string fullName = GetName(loadUnloadData);
+                                string key = fullName + "@" + loadUnloadData.MethodID.ToString("X");
+                                if (!ImageMap.ContainsKey(key))
                                 {
                                     // Pretend this is an "image"
                                     MethodLoadUnloadVerboseTraceData loadUnloadData = (MethodLoadUnloadVerboseTraceData)data;
@@ -380,14 +405,10 @@ namespace CoreClrInstRetired
 
             AttributeSampleCounts();
 
-            //foreach (var e in allEventCounts)
-            //{
-            //    Console.WriteLine("Event {0} occurred {1} times", e.Key, e.Value);
-            //}
-            //foreach (var e in processCounts)
-            //{
-            //    Console.WriteLine("Process {0} had {1} events", e.Key, e.Value);
-            //}
+            foreach (var e in allEventCounts)
+            {
+                Console.WriteLine("Event {0} occurred {1} times", e.Key, e.Value);
+            }
 
             if (!eventCounts.ContainsKey("PerfInfo/PMCSample"))
             {
@@ -395,7 +416,6 @@ namespace CoreClrInstRetired
             }
             else
             {
-
                 ulong InstrsPerEvent = 65536;
                 ulong pmcEvents = eventCounts["PerfInfo/PMCSample"];
 
@@ -441,6 +461,8 @@ namespace CoreClrInstRetired
                         i.Name);
                 }
             }
+
+            return 0;
         }
     }
 }
