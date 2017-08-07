@@ -368,14 +368,7 @@ namespace CoreClrInstRetired
                                     }
                                     break;
                                 }
-                            }
-                        case "Method/UnloadVerbose":
-                            {
-                                // Pretend this is an "image"
-                                MethodLoadUnloadVerboseTraceData loadUnloadData = (MethodLoadUnloadVerboseTraceData)data;
-                                string fullName = GetName(loadUnloadData);
-                                string key = fullName + "@" + loadUnloadData.MethodID.ToString("X");
-                                if (!ImageMap.ContainsKey(key))
+                            case "Method/UnloadVerbose":
                                 {
                                     // Pretend this is an "image"
                                     MethodLoadUnloadVerboseTraceData loadUnloadData = (MethodLoadUnloadVerboseTraceData)data;
@@ -383,6 +376,7 @@ namespace CoreClrInstRetired
                                     string key = fullName + "@" + loadUnloadData.MethodID.ToString("X");
                                     if (!ImageMap.ContainsKey(key))
                                     {
+                                        // Pretend this is an "image"
                                         ImageInfo methodInfo = new ImageInfo(fullName, loadUnloadData.MethodStartAddress,
                                             loadUnloadData.MethodSize);
                                         ImageMap.Add(key, methodInfo);
@@ -393,26 +387,25 @@ namespace CoreClrInstRetired
                                     //{
                                     //    Console.WriteLine("eh? see method {0} again in rundown", fullName);
                                     //}
-                                    break;
                                 }
+                                break;
                         }
                     }
                 };
 
                 source.Process();
-            }
-
+            };
 
             AttributeSampleCounts();
 
-            foreach (var e in allEventCounts)
-            {
-                Console.WriteLine("Event {0} occurred {1} times", e.Key, e.Value);
-            }
+            //foreach (var e in allEventCounts)
+            //{
+            //    Console.WriteLine("Event {0} occurred {1} times", e.Key, e.Value);
+            //}
 
             if (!eventCounts.ContainsKey("PerfInfo/PMCSample"))
             {
-                Console.WriteLine("No PMC events seen, sorry.");
+                Console.WriteLine("No PMC events seen for {0}, sorry.", benchmarkName);
             }
             else
             {
@@ -421,12 +414,16 @@ namespace CoreClrInstRetired
 
                 Console.WriteLine("InstRetired for {0}: {1} events, {2:E} instrs",
                     benchmarkName, pmcEvents, pmcEvents * InstrsPerEvent);
-                Console.WriteLine("Jitting           : {0:00.00%} ({1} methods)",
-                    (double)JitSampleCount / TotalSampleCount, AllJitInvocations.Count);
-                // Console.WriteLine("  JitInterface    : {0:00.00%}", (double) JitSampleCount - JitDllSampleCount);
-                Console.WriteLine("Jit-generated code: {0:00.00%}", (double)JitGeneratedCodeSampleCount / TotalSampleCount);
-                Console.WriteLine("  Jitted code     : {0:00.00%}", (double)JittedCodeSampleCount / TotalSampleCount);
-                Console.WriteLine();
+
+                if (AllJitInvocations.Count > 0)
+                {
+                    Console.WriteLine("Jitting           : {0:00.00%} ({1} methods)",
+                        (double)JitSampleCount / TotalSampleCount, AllJitInvocations.Count);
+                    // Console.WriteLine("  JitInterface    : {0:00.00%}", (double) JitSampleCount - JitDllSampleCount);
+                    Console.WriteLine("Jit-generated code: {0:00.00%}", (double)JitGeneratedCodeSampleCount / TotalSampleCount);
+                    Console.WriteLine("  Jitted code     : {0:00.00%}", (double)JittedCodeSampleCount / TotalSampleCount);
+                    Console.WriteLine();
+                }
 
                 double ufrac = (double)UnknownImageCount / TotalSampleCount;
                 if (ufrac > 0.002)
@@ -463,6 +460,7 @@ namespace CoreClrInstRetired
             }
 
             return 0;
+
         }
     }
 }
