@@ -16,6 +16,8 @@ namespace CoreClrInstRetired
         public ulong EndAddress;
         public bool IsJitGeneratedCode;
         public bool IsJittedCode;
+        public bool IsRejittedCode;
+        public bool IsBackupImage;
 
         public ImageInfo(string name, ulong baseAddress, int size)
         {
@@ -25,6 +27,7 @@ namespace CoreClrInstRetired
             EndAddress = baseAddress + (uint)Size;
             SampleCount = 0;
             IsJitGeneratedCode = false;
+            IsBackupImage = false;
         }
 
         public static int LowerAddress(ImageInfo x, ImageInfo y)
@@ -32,6 +35,10 @@ namespace CoreClrInstRetired
             if (x.BaseAddress < y.BaseAddress)
                 return -1;
             else if (x.BaseAddress > y.BaseAddress)
+                return 1;
+            else if (x.EndAddress > y.EndAddress)
+                return -1;
+            else if (x.EndAddress > y.EndAddress)
                 return 1;
             else
                 return 0;
@@ -49,7 +56,7 @@ namespace CoreClrInstRetired
 
         public bool ContainsAddress(ulong address)
         {
-            return (BaseAddress >= address && EndAddress < address);
+            return (address >= BaseAddress && address < EndAddress);
         }
     }
 
@@ -59,6 +66,18 @@ namespace CoreClrInstRetired
         public long MethodId;
         public ulong InitialThreadCount;
         public ulong FinalThreadCount;
+        public string MethodName;
+
+        public static int MoreJitTime(JitInvocation x, JitInvocation y)
+        {
+            ulong samplesX = x.FinalThreadCount - x.InitialThreadCount;
+            ulong samplesY = y.FinalThreadCount - y.InitialThreadCount;
+            if (samplesX < samplesY)
+                return 1;
+            else if (samplesY < samplesX)
+                return -1;
+            else return x.MethodId.CompareTo(y.MethodId);
+        }
     }
 
     public class Program
@@ -75,6 +94,8 @@ namespace CoreClrInstRetired
         public static ulong UnknownImageCount = 0;
         public static ulong JittedCodeSize = 0;
         public static ulong ManagedMethodCount = 0;
+        public static ulong PMCInterval = 65536;
+        public static string jitDllKey;
 
         static void UpdateSampleCountMap(ulong address, ulong count)
         {
@@ -101,55 +122,66 @@ namespace CoreClrInstRetired
             ImageInfo[] imageArray = new ImageInfo[ImageMap.Count];
             ImageMap.Values.CopyTo(imageArray, 0);
             Array.Sort(imageArray, ImageInfo.LowerAddress);
-
-            // Walk sorted sample count map and attribute counts.
-            int imageIndex = 0;
-            ImageInfo image = imageArray[imageIndex];
+            int index = 0;
+            int backupIndex = 0;
 
             foreach (ulong address in SampleCountMap.Keys)
             {
-                while ((imageIndex < imageArray.Length) && (address >= image.EndAddress))
-                {
-                    ImageInfo nextImage = imageArray[imageIndex++];
-                    if (nextImage.BaseAddress < image.EndAddress)
-                    {
-                        if ((nextImage.BaseAddress != image.BaseAddress)
-                            || (nextImage.EndAddress != image.EndAddress)
-                            || !nextImage.Name.Equals(image.Name))
-                        {
-                            Console.WriteLine("eh? {0} [{1:X}-{2:X}) and {3} [{4:X}-{5:X}) overlap",
-                                image.Name, image.BaseAddress, image.EndAddress,
-                                nextImage.Name, nextImage.BaseAddress, nextImage.EndAddress);
-                        }
-                    }
+                ImageInfo image = null;
 
-                    image = nextImage;
+                // See if any non-backup image can claim this address.
+                for (int i = index; i < imageArray.Length; i++)
+                {
+                    if (!imageArray[i].IsBackupImage && imageArray[i].ContainsAddress(address))
+                    {
+                        image = imageArray[i];
+                        index = i;
+                        break;
+                    }
                 }
 
-                if (address >= image.EndAddress || address < image.BaseAddress)
+                // If that fails, see if any backup image can claim this address
+                if (image == null)
                 {
-                    if (UnknownImageCount < 4)
+                    for (int i = backupIndex; i < imageArray.Length; i++)
                     {
-                        Console.WriteLine("Can't map address {0:X}", address);
+                        if (imageArray[i].IsBackupImage && imageArray[i].ContainsAddress(address))
+                        {
+                            image = imageArray[i];
+                            backupIndex = i;
+                            break;
+                        }
                     }
-                    UnknownImageCount += SampleCountMap[address];
+                }
+
+                ulong counts = SampleCountMap[address];
+
+                if (image == null)
+                {
+                    bool significant = ((double)counts / TotalSampleCount) > 0.001;
+                    if (significant)
+                    {
+                        Console.WriteLine("Can't map address {0:X} -- {1} counts", address, SampleCountMap[address]);
+                    }
+                    UnknownImageCount += counts;
                     continue;
                 }
 
-                image.SampleCount += SampleCountMap[address];
+                image.SampleCount += counts;
+
                 if (image.IsJitGeneratedCode)
                 {
-                    JitGeneratedCodeSampleCount += SampleCountMap[address];
+                    JitGeneratedCodeSampleCount += counts;
                 }
                 if (image.IsJittedCode)
                 {
-                    JittedCodeSampleCount += SampleCountMap[address];
+                    JittedCodeSampleCount += counts;
                 }
                 continue;
             }
         }
 
-        private static string GetName(MethodLoadUnloadVerboseTraceData data)
+        private static string GetName(MethodLoadUnloadVerboseTraceData data, string assembly)
         {
             // Prepare sig (strip return value)
             var sig = "";
@@ -168,7 +200,7 @@ namespace CoreClrInstRetired
             if (className.Length == 0)
                 sep = "";
 
-            return className + sep + data.MethodName + sig;
+            return assembly + className + sep + data.MethodName + sig;
         }
 
         public static int Main(string[] args)
@@ -193,6 +225,8 @@ namespace CoreClrInstRetired
             Dictionary<string, uint> allEventCounts = new Dictionary<string, uint>();
             Dictionary<string, uint> eventCounts = new Dictionary<string, uint>();
             Dictionary<string, uint> processCounts = new Dictionary<string, uint>();
+            Dictionary<long, ModuleLoadUnloadTraceData> moduleInfo = new Dictionary<long, ModuleLoadUnloadTraceData>();
+            Dictionary<long, string> assemblyNames = new Dictionary<long, string>();
 
             using (var source = new ETWTraceEventSource(traceFile))
             {
@@ -243,7 +277,7 @@ namespace CoreClrInstRetired
                             {
                                 ImageLoadTraceData imageLoadTraceData = (ImageLoadTraceData)data;
 
-                                if (data.ProcessID == 0)
+                                if (data.ProcessID == 0 || data.ProcessID == benchmarkPid)
                                 {
                                     string fileName = imageLoadTraceData.FileName;
                                     ulong imageBase = imageLoadTraceData.ImageBase;
@@ -271,20 +305,30 @@ namespace CoreClrInstRetired
                                     ulong imageBase = imageLoadTraceData.ImageBase;
                                     int imageSize = imageLoadTraceData.ImageSize;
 
-                                    // Suppress ngen images here, otherwise we lose visibility
+                                    // Hackily suppress ngen images here, otherwise we lose visibility
                                     // into ngen methods...
 
-                                    if (fileName.Contains(".ni."))
-                                    {
-                                        break;
-                                    }
+
 
                                     string fullName = fileName + "@" + imageBase.ToString();
 
                                     if (!ImageMap.ContainsKey(fullName))
                                     {
                                         ImageInfo imageInfo = new ImageInfo(Path.GetFileName(fileName), imageBase, imageSize);
+
+                                        if (fileName.Contains("Microsoft.") || fileName.Contains("System.") || fileName.Contains("Newtonsoft."))
+                                        {
+                                            imageInfo.IsBackupImage = true;
+                                        }
+
                                         ImageMap.Add(fullName, imageInfo);
+
+                                        if (fileName.Contains("clrjit.dll"))
+                                        {
+                                            jitDllKey = fullName;
+                                        }
+
+
                                     }
                                 }
 
@@ -304,6 +348,12 @@ namespace CoreClrInstRetired
                                 }
                                 break;
                             }
+
+                        case "PerfInfo/CollectionStart":
+                            SampledProfileIntervalTraceData sampleData = (SampledProfileIntervalTraceData)data;
+                            PMCInterval = (ulong)sampleData.NewInterval;
+                            Console.WriteLine($"PMC interval now {PMCInterval}");
+                            break;
                     }
                 };
 
@@ -331,12 +381,29 @@ namespace CoreClrInstRetired
 
                         switch (data.EventName)
                         {
+                            case "Loader/AssemblyLoad":
+                                {
+                                    AssemblyLoadUnloadTraceData assemblyData = (AssemblyLoadUnloadTraceData)data;
+                                    string assemblyName = assemblyData.FullyQualifiedAssemblyName;
+                                    int cpos = assemblyName.IndexOf(',');
+                                    string shortAssemblyName = '[' + assemblyName.Substring(0, cpos) + ']';
+                                    assemblyNames[assemblyData.AssemblyID] = shortAssemblyName;
+                                    // Console.WriteLine($"Assembly {shortAssemblyName} at 0x{assemblyData.AssemblyID:X} ");
+                                    break;
+                                }
+                            case "Loader/ModuleLoad":
+                                {
+                                    ModuleLoadUnloadTraceData moduleData = (ModuleLoadUnloadTraceData)data;
+                                    moduleInfo[moduleData.ModuleID] = moduleData;
+                                    break;
+                                }
                             case "Method/JittingStarted":
                                 {
                                     MethodJittingStartedTraceData jitStartData = (MethodJittingStartedTraceData)data;
                                     JitInvocation jitInvocation = new JitInvocation();
                                     jitInvocation.ThreadId = jitStartData.ThreadID;
                                     jitInvocation.MethodId = jitStartData.MethodID;
+                                    UpdateThreadCountMap(jitInvocation.ThreadId, 0); // hack
                                     jitInvocation.InitialThreadCount = ThreadCountMap[jitInvocation.ThreadId];
                                     ActiveJitInvocations.Add(jitInvocation.ThreadId, jitInvocation);
                                     AllJitInvocations.Add(jitInvocation);
@@ -345,9 +412,12 @@ namespace CoreClrInstRetired
                             case "Method/LoadVerbose":
                                 {
                                     MethodLoadUnloadVerboseTraceData loadUnloadData = (MethodLoadUnloadVerboseTraceData)data;
+
+                                    JitInvocation j = null;
+
                                     if (ActiveJitInvocations.ContainsKey(loadUnloadData.ThreadID))
                                     {
-                                        JitInvocation j = ActiveJitInvocations[loadUnloadData.ThreadID];
+                                        j = ActiveJitInvocations[loadUnloadData.ThreadID];
                                         ActiveJitInvocations.Remove(j.ThreadId);
                                         j.FinalThreadCount = ThreadCountMap[j.ThreadId];
                                         if (j.FinalThreadCount < j.InitialThreadCount)
@@ -366,14 +436,45 @@ namespace CoreClrInstRetired
                                     {
                                         // ?
                                     }
+
+                                    // Pretend this is an "image"
+                                    long assemblyId = moduleInfo[loadUnloadData.ModuleID].AssemblyID;
+                                    string assemblyName = "";
+                                    if (assemblyNames.ContainsKey(assemblyId))
+                                    {
+                                        assemblyName = assemblyNames[assemblyId];
+                                    }
+
+                                    string fullName = GetName(loadUnloadData, assemblyName);
+                                    if (j != null) j.MethodName = fullName;
+                                    // string key = fullName + "@" + loadUnloadData.MethodID.ToString("X");
+                                    string key = loadUnloadData.MethodID.ToString("X");
+                                    if (!ImageMap.ContainsKey(key))
+                                    {
+                                        ImageInfo methodInfo = new ImageInfo(fullName, loadUnloadData.MethodStartAddress,
+                                           loadUnloadData.MethodSize);
+                                        ImageMap.Add(key, methodInfo);
+                                        methodInfo.IsJitGeneratedCode = true;
+                                        methodInfo.IsJittedCode = loadUnloadData.IsJitted;
+                                        methodInfo.IsRejittedCode = false; // needs V2 parser
+                                    }
+
                                     break;
                                 }
                             case "Method/UnloadVerbose":
                                 {
                                     // Pretend this is an "image"
                                     MethodLoadUnloadVerboseTraceData loadUnloadData = (MethodLoadUnloadVerboseTraceData)data;
-                                    string fullName = GetName(loadUnloadData);
-                                    string key = fullName + "@" + loadUnloadData.MethodID.ToString("X");
+
+                                    long assemblyId = moduleInfo[loadUnloadData.ModuleID].AssemblyID;
+                                    string assemblyName = "";
+                                    if (assemblyNames.ContainsKey(assemblyId))
+                                    {
+                                        assemblyName = assemblyNames[assemblyId];
+                                    }
+                                    string fullName = GetName(loadUnloadData, assemblyName);
+                                    // string key = fullName + "@" + loadUnloadData.MethodID.ToString("X");
+                                    string key = loadUnloadData.MethodID.ToString("X");
                                     if (!ImageMap.ContainsKey(key))
                                     {
                                         // Pretend this is an "image"
@@ -383,10 +484,10 @@ namespace CoreClrInstRetired
                                         methodInfo.IsJitGeneratedCode = true;
                                         methodInfo.IsJittedCode = loadUnloadData.IsJitted;
                                     }
-                                    //else
-                                    //{
-                                    //    Console.WriteLine("eh? see method {0} again in rundown", fullName);
-                                    //}
+                                    else
+                                    {
+                                        // Console.WriteLine("eh? see method {0} again in rundown", fullName);
+                                    }
                                 }
                                 break;
                         }
@@ -409,26 +510,31 @@ namespace CoreClrInstRetired
             }
             else
             {
-                ulong InstrsPerEvent = 65536;
+                ulong InstrsPerEvent = PMCInterval;
                 ulong pmcEvents = eventCounts["PerfInfo/PMCSample"];
+                ulong JitDllSampleCount = ImageMap[jitDllKey].SampleCount;
+                ulong JitInterfaceCount = JitSampleCount - JitDllSampleCount;
 
                 Console.WriteLine("InstRetired for {0}: {1} events, {2:E} instrs",
                     benchmarkName, pmcEvents, pmcEvents * InstrsPerEvent);
 
                 if (AllJitInvocations.Count > 0)
                 {
-                    Console.WriteLine("Jitting           : {0:00.00%} ({1} methods)",
-                        (double)JitSampleCount / TotalSampleCount, AllJitInvocations.Count);
-                    // Console.WriteLine("  JitInterface    : {0:00.00%}", (double) JitSampleCount - JitDllSampleCount);
-                    Console.WriteLine("Jit-generated code: {0:00.00%}", (double)JitGeneratedCodeSampleCount / TotalSampleCount);
-                    Console.WriteLine("  Jitted code     : {0:00.00%}", (double)JittedCodeSampleCount / TotalSampleCount);
+                    Console.WriteLine("Jitting           : {0:00.00%} {1,-8:G3} instructions {2} methods",
+                        (double)JitSampleCount / TotalSampleCount, JitSampleCount * InstrsPerEvent, AllJitInvocations.Count);
+                    Console.WriteLine("  JitInterface    : {0:00.00%} {1,-8:G3} instructions",
+                        (double)JitInterfaceCount / TotalSampleCount, JitInterfaceCount * InstrsPerEvent);
+                    Console.WriteLine("Jit-generated code: {0:00.00%} {1,-8:G3} instructions",
+                        (double)JitGeneratedCodeSampleCount / TotalSampleCount, JitGeneratedCodeSampleCount * InstrsPerEvent);
+                    Console.WriteLine("  Jitted code     : {0:00.00%} {1,-8:G3} instructions",
+                        (double)JittedCodeSampleCount / TotalSampleCount, JittedCodeSampleCount * InstrsPerEvent);
                     Console.WriteLine();
                 }
 
                 double ufrac = (double)UnknownImageCount / TotalSampleCount;
                 if (ufrac > 0.002)
                 {
-                    Console.WriteLine("{0:00.00%}   {1,-8:G3}   {2} {3}",
+                    Console.WriteLine("{0:00.00%}   {1,-8:G3}    {2} {3}",
                         ufrac,
                         UnknownImageCount * InstrsPerEvent,
                         "?      ",
@@ -441,7 +547,7 @@ namespace CoreClrInstRetired
                 foreach (var i in ImageMap)
                 {
                     double frac = (double)i.Value.SampleCount / TotalSampleCount;
-                    if (frac > 0.002)
+                    if (frac > 0.0005)
                     {
                         significantInfos.Add(i.Value);
                     }
@@ -451,11 +557,33 @@ namespace CoreClrInstRetired
 
                 foreach (var i in significantInfos)
                 {
-                    Console.WriteLine("{0:00.00%}   {1,-8:G3}   {2}  {3}",
+                    Console.WriteLine("{0:00.00%}   {1,-9:G4}   {2}  {3}",
                         (double)i.SampleCount / TotalSampleCount,
                         i.SampleCount * InstrsPerEvent,
-                        i.IsJitGeneratedCode ? (i.IsJittedCode ? "jit   " : "prejit") : "native",
+                        i.IsJitGeneratedCode ? (i.IsJittedCode ? (i.IsRejittedCode ? "rejit " : "jit   ") : "prejit") : "native",
                         i.Name);
+                }
+
+                // Show significant jit invocations
+                AllJitInvocations.Sort(JitInvocation.MoreJitTime);
+                bool printed = false;
+                ulong signficantCount = (2 * JitSampleCount) / 1000;
+                foreach (var j in AllJitInvocations)
+                {
+                    if (j.FinalThreadCount > j.InitialThreadCount)
+                    {
+                        ulong totalCount = j.FinalThreadCount - j.InitialThreadCount;
+                        if (totalCount > signficantCount)
+                        {
+                            if (!printed)
+                            {
+                                Console.WriteLine();
+                                Console.WriteLine("Slow jitting methods (anything taking more than 0.2% of total samples)");
+                                printed = true;
+                            }
+                            Console.WriteLine("{0:00.00%}    {1,-9:G4} {2}", (double)totalCount / TotalSampleCount, totalCount * InstrsPerEvent, j.MethodName);
+                        }
+                    }
                 }
             }
 
