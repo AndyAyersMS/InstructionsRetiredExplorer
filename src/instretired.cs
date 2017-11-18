@@ -4,6 +4,7 @@ using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 
 namespace CoreClrInstRetired
 {
@@ -67,16 +68,42 @@ namespace CoreClrInstRetired
         public ulong InitialThreadCount;
         public ulong FinalThreadCount;
         public string MethodName;
+        public JitInvocation PriorJitInvocation;
+        public double InitialTimestamp;
+        public double FinalTimestamp;
 
-        public static int MoreJitTime(JitInvocation x, JitInvocation y)
+        public static int MoreJitInstructions(JitInvocation x, JitInvocation y)
         {
-            ulong samplesX = x.FinalThreadCount - x.InitialThreadCount;
-            ulong samplesY = y.FinalThreadCount - y.InitialThreadCount;
+            ulong samplesX = x.JitInstrs();
+            ulong samplesY = y.JitInstrs();
             if (samplesX < samplesY)
                 return 1;
             else if (samplesY < samplesX)
                 return -1;
             else return x.MethodId.CompareTo(y.MethodId);
+        }
+
+        public static int MoreJitTime(JitInvocation x, JitInvocation y)
+        {
+            double timeX = x.JitTime();
+            double timeY = y.JitTime(); ;
+            if (timeX < timeY)
+                return 1;
+            else if (timeY < timeX)
+                return -1;
+            else return x.MethodId.CompareTo(y.MethodId);
+        }
+
+        public double JitTime()
+        {
+            if (FinalTimestamp < InitialTimestamp) return 0;
+            return (FinalTimestamp - InitialTimestamp);
+        }
+
+        public ulong JitInstrs()
+        {
+            if (FinalThreadCount < InitialThreadCount) return 0;
+            return (FinalThreadCount - InitialThreadCount);
         }
     }
 
@@ -96,6 +123,8 @@ namespace CoreClrInstRetired
         public static ulong ManagedMethodCount = 0;
         public static ulong PMCInterval = 65536;
         public static string jitDllKey;
+        public static double ProcessStart;
+        public static double ProcessEnd;
 
         static void UpdateSampleCountMap(ulong address, ulong count)
         {
@@ -205,19 +234,46 @@ namespace CoreClrInstRetired
 
         public static int Main(string[] args)
         {
-            if (args.Length != 1 && args.Length != 3)
+            if (args.Length < 1 || args.Length > 4)
             {
-                Console.WriteLine("Usage: instretired file.etl [-process process-name]");
+                Console.WriteLine("Usage: instretired file.etl [-process process-name] [-show-events]");
                 Console.WriteLine("   process defaults to corerun");
                 return -1;
             }
 
             string traceFile = args[0];
-            string benchmarkName = "corerun";
-            int benchmarkPid = -2;
-            if (args.Length == 3)
+
+            if (!File.Exists(traceFile))
             {
-                benchmarkName = args[2];
+                Console.WriteLine($"Can't find trace file '{traceFile}'");
+                return -1;
+            }
+
+            string benchmarkName = "corerun";
+            bool showEvents = false;
+            int benchmarkPid = -2;
+
+            for (int i = 1; i < args.Length; i++)
+            {
+                switch (args[i])
+                {
+                    case "-process":
+                        {
+                            if (i + 1 == args.Length)
+                            {
+                                Console.WriteLine($"Missing process name after '{args[i]}'");
+                            }
+                            benchmarkName = args[i + 1];
+                            i++;
+                        }
+                        break;
+                    case "-show-events":
+                        showEvents = true;
+                        break;
+                    default:
+                        Console.WriteLine($"Unknown arg '{args[i]}'");
+                        return -1;
+                }
             }
 
             Console.WriteLine("Mining ETL from {0} for process {1}", traceFile, benchmarkName);
@@ -265,6 +321,7 @@ namespace CoreClrInstRetired
                                 {
                                     Console.WriteLine("Found process [{0}] {1}: {2}", pdata.ProcessID, pdata.ProcessName, pdata.CommandLine);
                                     benchmarkPid = pdata.ProcessID;
+                                    ProcessStart = pdata.TimeStampRelativeMSec;
                                 }
                                 else
                                 {
@@ -307,8 +364,6 @@ namespace CoreClrInstRetired
 
                                     // Hackily suppress ngen images here, otherwise we lose visibility
                                     // into ngen methods...
-
-
 
                                     string fullName = fileName + "@" + imageBase.ToString();
 
@@ -403,8 +458,14 @@ namespace CoreClrInstRetired
                                     JitInvocation jitInvocation = new JitInvocation();
                                     jitInvocation.ThreadId = jitStartData.ThreadID;
                                     jitInvocation.MethodId = jitStartData.MethodID;
+                                    jitInvocation.InitialTimestamp = jitStartData.TimeStampRelativeMSec;
                                     UpdateThreadCountMap(jitInvocation.ThreadId, 0); // hack
                                     jitInvocation.InitialThreadCount = ThreadCountMap[jitInvocation.ThreadId];
+                                    if (ActiveJitInvocations.ContainsKey(jitInvocation.ThreadId))
+                                    {
+                                        jitInvocation.PriorJitInvocation = ActiveJitInvocations[jitInvocation.ThreadId];
+                                        ActiveJitInvocations.Remove(jitInvocation.ThreadId);
+                                    }
                                     ActiveJitInvocations.Add(jitInvocation.ThreadId, jitInvocation);
                                     AllJitInvocations.Add(jitInvocation);
                                     break;
@@ -419,16 +480,13 @@ namespace CoreClrInstRetired
                                     {
                                         j = ActiveJitInvocations[loadUnloadData.ThreadID];
                                         ActiveJitInvocations.Remove(j.ThreadId);
+                                        if (j.PriorJitInvocation != null)
+                                        {
+                                            ActiveJitInvocations.Add(j.ThreadId, j.PriorJitInvocation);
+                                        }
                                         j.FinalThreadCount = ThreadCountMap[j.ThreadId];
-                                        if (j.FinalThreadCount < j.InitialThreadCount)
-                                        {
-                                            Console.WriteLine("eh? negative jit count...");
-                                        }
-                                        else
-                                        {
-                                            JitSampleCount += j.FinalThreadCount - j.InitialThreadCount;
-                                        }
-
+                                        j.FinalTimestamp = loadUnloadData.TimeStampRelativeMSec;
+                                        JitSampleCount += j.JitInstrs();
                                         ManagedMethodCount++;
                                         JittedCodeSize += (ulong)loadUnloadData.MethodExtent;
                                     }
@@ -499,10 +557,15 @@ namespace CoreClrInstRetired
 
             AttributeSampleCounts();
 
-            //foreach (var e in allEventCounts)
-            //{
-            //    Console.WriteLine("Event {0} occurred {1} times", e.Key, e.Value);
-            //}
+            if (showEvents)
+            {
+                Console.WriteLine("Event Breakdown");
+
+                foreach (var e in allEventCounts)
+                {
+                    Console.WriteLine("Event {0} occurred {1} times", e.Key, e.Value);
+                }
+            }
 
             if (!eventCounts.ContainsKey("PerfInfo/PMCSample"))
             {
@@ -564,26 +627,51 @@ namespace CoreClrInstRetired
                         i.Name);
                 }
 
-                // Show significant jit invocations
-                AllJitInvocations.Sort(JitInvocation.MoreJitTime);
+                // Show significant jit invocations (samples)
+                AllJitInvocations.Sort(JitInvocation.MoreJitInstructions);
                 bool printed = false;
-                ulong signficantCount = (2 * JitSampleCount) / 1000;
+                ulong signficantCount = (5 * JitSampleCount) / 1000;
                 foreach (var j in AllJitInvocations)
                 {
-                    if (j.FinalThreadCount > j.InitialThreadCount)
+                    ulong totalCount = j.JitInstrs();
+                    if (totalCount > signficantCount)
                     {
-                        ulong totalCount = j.FinalThreadCount - j.InitialThreadCount;
-                        if (totalCount > signficantCount)
+                        if (!printed)
                         {
-                            if (!printed)
-                            {
-                                Console.WriteLine();
-                                Console.WriteLine("Slow jitting methods (anything taking more than 0.2% of total samples)");
-                                printed = true;
-                            }
-                            Console.WriteLine("{0:00.00%}    {1,-9:G4} {2}", (double)totalCount / TotalSampleCount, totalCount * InstrsPerEvent, j.MethodName);
+                            Console.WriteLine();
+                            Console.WriteLine("Slow jitting methods (anything taking more than 0.5% of total samples)");
+                            printed = true;
                         }
+                        Console.WriteLine("{0:00.00%}    {1,-9:G4} {2}", (double)totalCount / TotalSampleCount, totalCount * InstrsPerEvent, j.MethodName);
                     }
+                }
+
+                Console.WriteLine();
+                double totalJitTime = AllJitInvocations.Sum(j => j.JitTime());
+                Console.WriteLine($"Total jit time: {totalJitTime:F2}ms {AllJitInvocations.Count} methods {totalJitTime/ AllJitInvocations.Count:F2}ms avg");
+
+                // Show 10 slowest jit invocations (time, ms)
+                AllJitInvocations.Sort(JitInvocation.MoreJitTime);
+                Console.WriteLine();
+                Console.WriteLine($"Slow jitting methods (time)");
+                int kLimit = 10;
+                for (int k = 0; k < kLimit; k++)
+                {
+                    if (k < AllJitInvocations.Count)
+                    {
+                        JitInvocation j = AllJitInvocations[k];
+                        Console.WriteLine($"{j.JitTime(),6:F2} {j.MethodName} starting at {j.InitialTimestamp,6:F2}");
+                    }
+                }
+
+                // Show data on cumulative distribution of jit times.
+                Console.WriteLine();
+                Console.WriteLine("Jit time percentiles");
+                for (int percentile = 10; percentile <= 100; percentile += 10)
+                {
+                    int pIndex = (AllJitInvocations.Count * (100 - percentile)) / 100;
+                    JitInvocation p = AllJitInvocations[pIndex];
+                    Console.WriteLine($"{percentile,3:D}%ile jit time is {p.JitTime():F3}ms");
                 }
             }
 
