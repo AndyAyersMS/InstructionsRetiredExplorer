@@ -19,6 +19,7 @@ namespace CoreClrInstRetired
         public bool IsJittedCode;
         public bool IsRejittedCode;
         public bool IsBackupImage;
+        public long AssemblyId;
 
         public ImageInfo(string name, ulong baseAddress, int size)
         {
@@ -29,6 +30,7 @@ namespace CoreClrInstRetired
             SampleCount = 0;
             IsJitGeneratedCode = false;
             IsBackupImage = false;
+            AssemblyId = -1;
         }
 
         public static int LowerAddress(ImageInfo x, ImageInfo y)
@@ -61,6 +63,30 @@ namespace CoreClrInstRetired
         }
     }
 
+    public class AssemblyInfo
+    {
+        public string Name;
+        public long Id;
+        public AssemblyFlags Flags;
+        public int NumberJitted;
+        public int NumberPrejitted;
+        public string CodegenKind;
+        public double TimeJitting;
+
+        public int MethodCount => NumberJitted + NumberPrejitted;
+
+        public static int MoreMethods(AssemblyInfo x, AssemblyInfo y)
+        {
+            return x.MethodCount - y.MethodCount;
+        }
+    }
+
+    public class ModuleInfo
+    {
+        public long Id;
+        public long AssemblyId;
+    }
+
     public class JitInvocation
     {
         public int ThreadId;
@@ -71,6 +97,7 @@ namespace CoreClrInstRetired
         public JitInvocation PriorJitInvocation;
         public double InitialTimestamp;
         public double FinalTimestamp;
+        public long AssemblyId;
 
         public static int MoreJitInstructions(JitInvocation x, JitInvocation y)
         {
@@ -236,7 +263,7 @@ namespace CoreClrInstRetired
         {
             if (args.Length < 1 || args.Length > 4)
             {
-                Console.WriteLine("Usage: instretired file.etl [-process process-name] [-show-events]");
+                Console.WriteLine("Usage: instretired file.etl [-process process-name] [-pid pid] [-show-events]");
                 Console.WriteLine("   process defaults to corerun");
                 return -1;
             }
@@ -251,6 +278,7 @@ namespace CoreClrInstRetired
 
             string benchmarkName = "corerun";
             bool showEvents = false;
+            int targetPid = -2;
             int benchmarkPid = -2;
 
             for (int i = 1; i < args.Length; i++)
@@ -264,6 +292,20 @@ namespace CoreClrInstRetired
                                 Console.WriteLine($"Missing process name after '{args[i]}'");
                             }
                             benchmarkName = args[i + 1];
+                            i++;
+                        }
+                        break;
+                    case "-pid":
+                        {
+                            if (i + 1 == args.Length)
+                            {
+                                Console.WriteLine($"Missing pid value after '{args[i]}'");
+                            }
+                            bool parsed = Int32.TryParse(args[i + 1], out targetPid);
+                            if (!parsed)
+                            {
+                                Console.WriteLine($"Can't parse `{args[i + 1]}` as pid value");
+                            }
                             i++;
                         }
                         break;
@@ -281,7 +323,8 @@ namespace CoreClrInstRetired
             Dictionary<string, uint> allEventCounts = new Dictionary<string, uint>();
             Dictionary<string, uint> eventCounts = new Dictionary<string, uint>();
             Dictionary<string, uint> processCounts = new Dictionary<string, uint>();
-            Dictionary<long, ModuleLoadUnloadTraceData> moduleInfo = new Dictionary<long, ModuleLoadUnloadTraceData>();
+            Dictionary<long, ModuleInfo> moduleInfo = new Dictionary<long, ModuleInfo>();
+            Dictionary<long, AssemblyInfo> assemblyInfo = new Dictionary<long, AssemblyInfo>();
             Dictionary<long, string> assemblyNames = new Dictionary<long, string>();
 
             using (var source = new ETWTraceEventSource(traceFile))
@@ -317,11 +360,15 @@ namespace CoreClrInstRetired
                                 // Process was running when tracing started (DCStart)
                                 // or started when tracing was running (Start)
                                 ProcessTraceData pdata = (ProcessTraceData)data;
-                                if (String.Equals(pdata.ProcessName, benchmarkName, StringComparison.OrdinalIgnoreCase))
+                                if (pdata.ProcessID == targetPid || String.Equals(pdata.ProcessName, benchmarkName, StringComparison.OrdinalIgnoreCase))
                                 {
                                     Console.WriteLine("Found process [{0}] {1}: {2}", pdata.ProcessID, pdata.ProcessName, pdata.CommandLine);
-                                    benchmarkPid = pdata.ProcessID;
-                                    ProcessStart = pdata.TimeStampRelativeMSec;
+
+                                    if (benchmarkPid == -2)
+                                    {
+                                        benchmarkPid = pdata.ProcessID;
+                                        ProcessStart = pdata.TimeStampRelativeMSec;
+                                    }
                                 }
                                 else
                                 {
@@ -442,14 +489,22 @@ namespace CoreClrInstRetired
                                     string assemblyName = assemblyData.FullyQualifiedAssemblyName;
                                     int cpos = assemblyName.IndexOf(',');
                                     string shortAssemblyName = '[' + assemblyName.Substring(0, cpos) + ']';
+                                    AssemblyInfo info = new AssemblyInfo();
+                                    info.Name = assemblyName.Substring(0, cpos);
+                                    info.Id = assemblyData.AssemblyID;
+                                    info.Flags = assemblyData.AssemblyFlags;
                                     assemblyNames[assemblyData.AssemblyID] = shortAssemblyName;
+                                    assemblyInfo[assemblyData.AssemblyID] = info;
                                     // Console.WriteLine($"Assembly {shortAssemblyName} at 0x{assemblyData.AssemblyID:X} ");
                                     break;
                                 }
                             case "Loader/ModuleLoad":
                                 {
                                     ModuleLoadUnloadTraceData moduleData = (ModuleLoadUnloadTraceData)data;
-                                    moduleInfo[moduleData.ModuleID] = moduleData;
+                                    ModuleInfo info = new ModuleInfo();
+                                    info.Id = moduleData.ModuleID;
+                                    info.AssemblyId = moduleData.AssemblyID;
+                                    moduleInfo[moduleData.ModuleID] = info;
                                     break;
                                 }
                             case "Method/JittingStarted":
@@ -459,6 +514,10 @@ namespace CoreClrInstRetired
                                     jitInvocation.ThreadId = jitStartData.ThreadID;
                                     jitInvocation.MethodId = jitStartData.MethodID;
                                     jitInvocation.InitialTimestamp = jitStartData.TimeStampRelativeMSec;
+                                    if (moduleInfo.ContainsKey(jitStartData.ModuleID))
+                                    {
+                                        jitInvocation.AssemblyId = moduleInfo[jitStartData.ModuleID].AssemblyId;
+                                    }
                                     UpdateThreadCountMap(jitInvocation.ThreadId, 0); // hack
                                     jitInvocation.InitialThreadCount = ThreadCountMap[jitInvocation.ThreadId];
                                     if (ActiveJitInvocations.ContainsKey(jitInvocation.ThreadId))
@@ -496,7 +555,7 @@ namespace CoreClrInstRetired
                                     }
 
                                     // Pretend this is an "image"
-                                    long assemblyId = moduleInfo[loadUnloadData.ModuleID].AssemblyID;
+                                    long assemblyId = moduleInfo[loadUnloadData.ModuleID].AssemblyId;
                                     string assemblyName = "";
                                     if (assemblyNames.ContainsKey(assemblyId))
                                     {
@@ -515,6 +574,7 @@ namespace CoreClrInstRetired
                                         methodInfo.IsJitGeneratedCode = true;
                                         methodInfo.IsJittedCode = loadUnloadData.IsJitted;
                                         methodInfo.IsRejittedCode = false; // needs V2 parser
+                                        methodInfo.AssemblyId = assemblyId;
                                     }
 
                                     break;
@@ -524,7 +584,7 @@ namespace CoreClrInstRetired
                                     // Pretend this is an "image"
                                     MethodLoadUnloadVerboseTraceData loadUnloadData = (MethodLoadUnloadVerboseTraceData)data;
 
-                                    long assemblyId = moduleInfo[loadUnloadData.ModuleID].AssemblyID;
+                                    long assemblyId = moduleInfo[loadUnloadData.ModuleID].AssemblyId;
                                     string assemblyName = "";
                                     if (assemblyNames.ContainsKey(assemblyId))
                                     {
@@ -541,6 +601,7 @@ namespace CoreClrInstRetired
                                         ImageMap.Add(key, methodInfo);
                                         methodInfo.IsJitGeneratedCode = true;
                                         methodInfo.IsJittedCode = loadUnloadData.IsJitted;
+                                        methodInfo.AssemblyId = assemblyId;
                                     }
                                     else
                                     {
@@ -645,35 +706,69 @@ namespace CoreClrInstRetired
                         Console.WriteLine("{0:00.00%}    {1,-9:G4} {2}", (double)totalCount / TotalSampleCount, totalCount * InstrsPerEvent, j.MethodName);
                     }
                 }
+            }
 
-                Console.WriteLine();
-                double totalJitTime = AllJitInvocations.Sum(j => j.JitTime());
-                Console.WriteLine($"Total jit time: {totalJitTime:F2}ms {AllJitInvocations.Count} methods {totalJitTime/ AllJitInvocations.Count:F2}ms avg");
+            Console.WriteLine();
+            double totalJitTime = AllJitInvocations.Sum(j => j.JitTime());
+            Console.WriteLine($"Total jit time: {totalJitTime:F2}ms {AllJitInvocations.Count} methods {totalJitTime / AllJitInvocations.Count:F2}ms avg");
 
-                // Show 10 slowest jit invocations (time, ms)
-                AllJitInvocations.Sort(JitInvocation.MoreJitTime);
-                Console.WriteLine();
-                Console.WriteLine($"Slow jitting methods (time)");
-                int kLimit = 10;
-                for (int k = 0; k < kLimit; k++)
+            // Show 10 slowest jit invocations (time, ms)
+            AllJitInvocations.Sort(JitInvocation.MoreJitTime);
+            Console.WriteLine();
+            Console.WriteLine($"Slow jitting methods (time)");
+            int kLimit = 10;
+            for (int k = 0; k < kLimit; k++)
+            {
+                if (k < AllJitInvocations.Count)
                 {
-                    if (k < AllJitInvocations.Count)
-                    {
-                        JitInvocation j = AllJitInvocations[k];
-                        Console.WriteLine($"{j.JitTime(),6:F2} {j.MethodName} starting at {j.InitialTimestamp,6:F2}");
-                    }
-                }
-
-                // Show data on cumulative distribution of jit times.
-                Console.WriteLine();
-                Console.WriteLine("Jit time percentiles");
-                for (int percentile = 10; percentile <= 100; percentile += 10)
-                {
-                    int pIndex = (AllJitInvocations.Count * (100 - percentile)) / 100;
-                    JitInvocation p = AllJitInvocations[pIndex];
-                    Console.WriteLine($"{percentile,3:D}%ile jit time is {p.JitTime():F3}ms");
+                    JitInvocation j = AllJitInvocations[k];
+                    Console.WriteLine($"{j.JitTime(),6:F2} {j.MethodName} starting at {j.InitialTimestamp,6:F2}");
                 }
             }
+
+            // Show data on cumulative distribution of jit times.
+            Console.WriteLine();
+            Console.WriteLine("Jit time percentiles");
+            for (int percentile = 10; percentile <= 100; percentile += 10)
+            {
+                int pIndex = (AllJitInvocations.Count * (100 - percentile)) / 100;
+                JitInvocation p = AllJitInvocations[pIndex];
+                Console.WriteLine($"{percentile,3:D}%ile jit time is {p.JitTime():F3}ms");
+            }
+
+            // Show assembly inventory
+            // Would be nice to have counts of jitted/prejitted per assembly, order by total number of methods somehow
+            Console.WriteLine();
+            Console.WriteLine("Per Assembly Jitting Details");
+            int totalJitted = 0;
+            foreach (var assemblyId in assemblyInfo.Keys)
+            {
+                AssemblyInfo info = assemblyInfo[assemblyId];
+
+                bool isNative = (info.Flags & AssemblyFlags.Native) != 0;
+                bool isDynamic = (info.Flags & AssemblyFlags.Dynamic) != 0;
+
+                info.NumberPrejitted = ImageMap.Where(x => x.Value.AssemblyId == assemblyId && x.Value.IsJitGeneratedCode && !x.Value.IsJittedCode).Count();
+                info.NumberJitted = ImageMap.Where(x => x.Value.AssemblyId == assemblyId && x.Value.IsJitGeneratedCode && x.Value.IsJittedCode).Count();
+
+                if (info.NumberJitted > 0)
+                {
+                    info.TimeJitting = AllJitInvocations.Where(x => x.AssemblyId == assemblyId).Sum(x => x.JitTime());
+                }
+                info.CodegenKind = isNative ? " [NGEN]" : info.NumberPrejitted > 0 ? " [R2R]" : isDynamic ? " [DYNAMIC]" : " [JITTED]";
+
+                totalJitted += info.NumberJitted;
+            }
+
+            foreach (var x in assemblyInfo.Values.OrderByDescending(x => x.TimeJitting))
+            {
+                if (x.NumberJitted > 0)
+                {
+                    Console.WriteLine($"{x.CodegenKind,10} {x.NumberPrejitted,5} prejitted {x.NumberJitted,5} jitted in {x.TimeJitting,8:F3}ms {100 * x.TimeJitting / totalJitTime,6:F2}% {x.Name} ");
+                }
+            }
+
+            Console.WriteLine($"{totalJitted,32} jitted in {totalJitTime,8:F3}ms 100.00% --- TOTAL ---");
 
             return 0;
 
