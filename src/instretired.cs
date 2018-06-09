@@ -140,11 +140,16 @@ namespace CoreClrInstRetired
         public static Dictionary<int, ulong> ThreadCountMap = new Dictionary<int, ulong>();
         public static Dictionary<string, ImageInfo> ImageMap = new Dictionary<string, ImageInfo>();
         public static Dictionary<int, JitInvocation> ActiveJitInvocations = new Dictionary<int, JitInvocation>();
+        public static Dictionary<long, ModuleInfo> moduleInfo = new Dictionary<long, ModuleInfo>();
+        public static Dictionary<long, AssemblyInfo> assemblyInfo = new Dictionary<long, AssemblyInfo>();
         public static List<JitInvocation> AllJitInvocations = new List<JitInvocation>();
         public static ulong JitSampleCount = 0;
         public static ulong TotalSampleCount = 0;
         public static ulong JitGeneratedCodeSampleCount = 0;
+        public static ulong RejittedCodeSampleCount = 0;
         public static ulong JittedCodeSampleCount = 0;
+        public static ulong NgenCodeSampleCount = 0;
+        public static ulong R2RCodeSampleCount = 0;
         public static ulong UnknownImageCount = 0;
         public static ulong JittedCodeSize = 0;
         public static ulong ManagedMethodCount = 0;
@@ -229,9 +234,29 @@ namespace CoreClrInstRetired
                 {
                     JitGeneratedCodeSampleCount += counts;
                 }
-                if (image.IsJittedCode)
+                if (image.IsRejittedCode)
+                {
+                    RejittedCodeSampleCount += counts;
+                }
+                else if (image.IsJittedCode)
                 {
                     JittedCodeSampleCount += counts;
+                }
+                else if (image.IsJitGeneratedCode)
+                {
+                    if (assemblyInfo.ContainsKey(image.AssemblyId))
+                    {
+                        AssemblyInfo assembly = assemblyInfo[image.AssemblyId];
+
+                        if ((assembly.Flags & AssemblyFlags.Native) != 0)
+                        {
+                            NgenCodeSampleCount += counts;
+                        }
+                        else
+                        {
+                            R2RCodeSampleCount += counts;
+                        }                    
+                    }
                 }
                 continue;
             }
@@ -323,8 +348,7 @@ namespace CoreClrInstRetired
             Dictionary<string, uint> allEventCounts = new Dictionary<string, uint>();
             Dictionary<string, uint> eventCounts = new Dictionary<string, uint>();
             Dictionary<string, uint> processCounts = new Dictionary<string, uint>();
-            Dictionary<long, ModuleInfo> moduleInfo = new Dictionary<long, ModuleInfo>();
-            Dictionary<long, AssemblyInfo> assemblyInfo = new Dictionary<long, AssemblyInfo>();
+
             Dictionary<long, string> assemblyNames = new Dictionary<long, string>();
 
             using (var source = new ETWTraceEventSource(traceFile))
@@ -564,8 +588,11 @@ namespace CoreClrInstRetired
 
                                     string fullName = GetName(loadUnloadData, assemblyName);
                                     if (j != null) j.MethodName = fullName;
+
+                                    // Console.WriteLine($"Load @ {loadUnloadData.MethodStartAddress:X16}: {fullName}");
+
                                     // string key = fullName + "@" + loadUnloadData.MethodID.ToString("X");
-                                    string key = loadUnloadData.MethodID.ToString("X");
+                                    string key = loadUnloadData.MethodID.ToString("X") + loadUnloadData.ReJITID;
                                     if (!ImageMap.ContainsKey(key))
                                     {
                                         ImageInfo methodInfo = new ImageInfo(fullName, loadUnloadData.MethodStartAddress,
@@ -573,8 +600,12 @@ namespace CoreClrInstRetired
                                         ImageMap.Add(key, methodInfo);
                                         methodInfo.IsJitGeneratedCode = true;
                                         methodInfo.IsJittedCode = loadUnloadData.IsJitted;
-                                        methodInfo.IsRejittedCode = false; // needs V2 parser
+                                        methodInfo.IsRejittedCode = loadUnloadData.ReJITID > 0;
                                         methodInfo.AssemblyId = assemblyId;
+                                    }
+                                    else
+                                    {
+                                        Console.WriteLine("eh? reloading method {fullName}");
                                     }
 
                                     break;
@@ -591,8 +622,11 @@ namespace CoreClrInstRetired
                                         assemblyName = assemblyNames[assemblyId];
                                     }
                                     string fullName = GetName(loadUnloadData, assemblyName);
+
+                                    // Console.WriteLine($"Unload @ {loadUnloadData.MethodStartAddress:X16}: {fullName}");
                                     // string key = fullName + "@" + loadUnloadData.MethodID.ToString("X");
-                                    string key = loadUnloadData.MethodID.ToString("X");
+                                    string key = loadUnloadData.MethodID.ToString("X") + loadUnloadData.ReJITID;
+
                                     if (!ImageMap.ContainsKey(key))
                                     {
                                         // Pretend this is an "image"
@@ -601,11 +635,12 @@ namespace CoreClrInstRetired
                                         ImageMap.Add(key, methodInfo);
                                         methodInfo.IsJitGeneratedCode = true;
                                         methodInfo.IsJittedCode = loadUnloadData.IsJitted;
+                                        methodInfo.IsRejittedCode = loadUnloadData.ReJITID > 0;
                                         methodInfo.AssemblyId = assemblyId;
                                     }
                                     else
                                     {
-                                        // Console.WriteLine("eh? see method {0} again in rundown", fullName);
+                                        Console.WriteLine("eh? see method {fullName} again in rundown");
                                     }
                                 }
                                 break;
@@ -652,6 +687,12 @@ namespace CoreClrInstRetired
                         (double)JitGeneratedCodeSampleCount / TotalSampleCount, JitGeneratedCodeSampleCount * InstrsPerEvent);
                     Console.WriteLine("  Jitted code     : {0:00.00%} {1,-8:G3} instructions",
                         (double)JittedCodeSampleCount / TotalSampleCount, JittedCodeSampleCount * InstrsPerEvent);
+                    Console.WriteLine("  ReJitted code     : {0:00.00%} {1,-8:G3} instructions",
+                        (double)RejittedCodeSampleCount / TotalSampleCount, RejittedCodeSampleCount * InstrsPerEvent);
+                    Console.WriteLine("  Ngen   code     : {0:00.00%} {1,-8:G3} instructions",
+                        (double)NgenCodeSampleCount / TotalSampleCount, NgenCodeSampleCount * InstrsPerEvent);
+                    Console.WriteLine("  R2R    code     : {0:00.00%} {1,-8:G3} instructions",
+                        (double)R2RCodeSampleCount / TotalSampleCount, R2RCodeSampleCount * InstrsPerEvent);
                     Console.WriteLine();
                 }
 
@@ -727,13 +768,16 @@ namespace CoreClrInstRetired
             }
 
             // Show data on cumulative distribution of jit times.
-            Console.WriteLine();
-            Console.WriteLine("Jit time percentiles");
-            for (int percentile = 10; percentile <= 100; percentile += 10)
+            if (AllJitInvocations.Count > 0)
             {
-                int pIndex = (AllJitInvocations.Count * (100 - percentile)) / 100;
-                JitInvocation p = AllJitInvocations[pIndex];
-                Console.WriteLine($"{percentile,3:D}%ile jit time is {p.JitTime():F3}ms");
+                Console.WriteLine();
+                Console.WriteLine("Jit time percentiles");
+                for (int percentile = 10; percentile <= 100; percentile += 10)
+                {
+                    int pIndex = (AllJitInvocations.Count * (100 - percentile)) / 100;
+                    JitInvocation p = AllJitInvocations[pIndex];
+                    Console.WriteLine($"{percentile,3:D}%ile jit time is {p.JitTime():F3}ms");
+                }
             }
 
             // Show assembly inventory
