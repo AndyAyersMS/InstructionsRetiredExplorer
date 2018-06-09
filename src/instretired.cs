@@ -605,7 +605,7 @@ namespace CoreClrInstRetired
                                     }
                                     else
                                     {
-                                        Console.WriteLine("eh? reloading method {fullName}");
+                                        Console.WriteLine($"eh? reloading method {fullName}");
                                     }
 
                                     break;
@@ -640,7 +640,7 @@ namespace CoreClrInstRetired
                                     }
                                     else
                                     {
-                                        Console.WriteLine("eh? see method {fullName} again in rundown");
+                                        // Console.WriteLine($"eh? see method {fullName} again in rundown");
                                     }
                                 }
                                 break;
