@@ -134,6 +134,12 @@ namespace CoreClrInstRetired
         }
     }
 
+    public class BenchmarkInterval
+    {
+        public double startTimestamp;
+        public double endTimestamp;
+    }
+
     public class Program
     {
         public static SortedDictionary<ulong, ulong> SampleCountMap = new SortedDictionary<ulong, ulong>();
@@ -143,6 +149,7 @@ namespace CoreClrInstRetired
         public static Dictionary<long, ModuleInfo> moduleInfo = new Dictionary<long, ModuleInfo>();
         public static Dictionary<long, AssemblyInfo> assemblyInfo = new Dictionary<long, AssemblyInfo>();
         public static List<JitInvocation> AllJitInvocations = new List<JitInvocation>();
+        public static List<BenchmarkInterval> BenchmarkIntervals = new List<BenchmarkInterval>();
         public static ulong JitSampleCount = 0;
         public static ulong TotalSampleCount = 0;
         public static ulong JitGeneratedCodeSampleCount = 0;
@@ -303,6 +310,8 @@ namespace CoreClrInstRetired
 
             string benchmarkName = "corerun";
             bool showEvents = false;
+            bool filterToBenchmark = false;
+            BenchmarkInterval benchmarkInterval = null;
             int targetPid = -2;
             int benchmarkPid = -2;
 
@@ -337,6 +346,9 @@ namespace CoreClrInstRetired
                     case "-show-events":
                         showEvents = true;
                         break;
+                    case "-benchmark":
+                        filterToBenchmark = true;
+                        break;
                     default:
                         Console.WriteLine($"Unknown arg '{args[i]}'");
                         return -1;
@@ -353,6 +365,50 @@ namespace CoreClrInstRetired
 
             using (var source = new ETWTraceEventSource(traceFile))
             {
+                source.Dynamic.All += delegate (TraceEvent data)
+                {
+                    if (allEventCounts.ContainsKey(data.EventName))
+                    {
+                        allEventCounts[data.EventName]++;
+                    }
+                    else
+                    {
+                        allEventCounts[data.EventName] = 1;
+                    }
+
+                    switch (data.EventName)
+                    {
+                        case "WorkloadActual/Start":
+                            {
+                                if (benchmarkInterval != null)
+                                {
+                                    Console.WriteLine($"Eh? benchmark intervals overlap at {data.TimeStampRelativeMSec}ms");
+                                }
+                                else
+                                {
+                                    benchmarkInterval = new BenchmarkInterval();
+                                    benchmarkInterval.startTimestamp = data.TimeStampRelativeMSec;
+                                }
+                            }
+                            break;
+                        case "WorkloadActual/Stop":
+                            {
+                                if (benchmarkInterval == null)
+                                {
+                                    Console.WriteLine($"Eh? benchmark intervals overlap at {data.TimeStampRelativeMSec}ms");
+                                }
+                                else
+                                {
+                                    benchmarkInterval.endTimestamp = data.TimeStampRelativeMSec;
+                                    BenchmarkIntervals.Add(benchmarkInterval);
+                                    benchmarkInterval = null;
+                                }
+
+                            }
+                            break;
+                    }
+                };
+
                 source.Kernel.All += delegate (TraceEvent data)
                 {
                     if (allEventCounts.ContainsKey(data.EventName))
@@ -444,7 +500,7 @@ namespace CoreClrInstRetired
 
                                         if (fileName.Contains("Microsoft.") || fileName.Contains("System.") || fileName.Contains("Newtonsoft."))
                                         {
-                                            imageInfo.IsBackupImage = true;
+                                            // imageInfo.IsBackupImage = true;
                                         }
 
                                         ImageMap.Add(fullName, imageInfo);
@@ -461,16 +517,34 @@ namespace CoreClrInstRetired
                                 break;
                             }
 
+                        case "PerfInfo/Sample":
+                            {
+                                SampledProfileTraceData traceData = (SampledProfileTraceData)data;
+                                if (traceData.ProcessID == benchmarkPid)
+                                {
+                                    if (!filterToBenchmark ||(benchmarkInterval != null))
+                                    {
+                                        ulong instructionPointer = traceData.InstructionPointer;
+                                        ulong count = PMCInterval;
+                                        UpdateSampleCountMap(instructionPointer, count);
+                                        UpdateThreadCountMap(traceData.ThreadID, count);
+                                    }
+                                }
+                                break;
+                            }
+
                         case "PerfInfo/PMCSample":
                             {
                                 PMCCounterProfTraceData traceData = (PMCCounterProfTraceData)data;
                                 if (traceData.ProcessID == benchmarkPid)
                                 {
-                                    ulong instructionPointer = traceData.InstructionPointer;
-                                    // Not sure how to find the PMC reload interval... sigh
-                                    ulong count = 1;
-                                    UpdateSampleCountMap(instructionPointer, count);
-                                    UpdateThreadCountMap(traceData.ThreadID, count);
+                                    if (!filterToBenchmark || (benchmarkInterval != null))
+                                    {
+                                        ulong instructionPointer = traceData.InstructionPointer;
+                                        ulong count = PMCInterval;
+                                        UpdateSampleCountMap(instructionPointer, count);
+                                        UpdateThreadCountMap(traceData.ThreadID, count);
+                                    }
                                 }
                                 break;
                             }
@@ -519,7 +593,7 @@ namespace CoreClrInstRetired
                                     info.Flags = assemblyData.AssemblyFlags;
                                     assemblyNames[assemblyData.AssemblyID] = shortAssemblyName;
                                     assemblyInfo[assemblyData.AssemblyID] = info;
-                                    // Console.WriteLine($"Assembly {shortAssemblyName} at 0x{assemblyData.AssemblyID:X} ");
+                                    // Console.WriteLine($"Assembly {shortAssemblyName} at 0x{assemblyData.AssemblyID:X}");
                                     break;
                                 }
                             case "Loader/ModuleLoad":
@@ -529,6 +603,7 @@ namespace CoreClrInstRetired
                                     info.Id = moduleData.ModuleID;
                                     info.AssemblyId = moduleData.AssemblyID;
                                     moduleInfo[moduleData.ModuleID] = info;
+                                    // Console.WriteLine($"Module {moduleData.ModuleILFileName} for assembly 0x{info.AssemblyId}");
                                     break;
                                 }
                             case "Method/JittingStarted":
@@ -579,33 +654,41 @@ namespace CoreClrInstRetired
                                     }
 
                                     // Pretend this is an "image"
-                                    long assemblyId = moduleInfo[loadUnloadData.ModuleID].AssemblyId;
-                                    string assemblyName = "";
-                                    if (assemblyNames.ContainsKey(assemblyId))
+
+                                    if (moduleInfo.ContainsKey(loadUnloadData.ModuleID))
                                     {
-                                        assemblyName = assemblyNames[assemblyId];
-                                    }
+                                        long assemblyId = moduleInfo[loadUnloadData.ModuleID].AssemblyId;
+                                        string assemblyName = "";
+                                        if (assemblyNames.ContainsKey(assemblyId))
+                                        {
+                                            assemblyName = assemblyNames[assemblyId];
+                                        }
 
-                                    string fullName = GetName(loadUnloadData, assemblyName);
-                                    if (j != null) j.MethodName = fullName;
+                                        string fullName = GetName(loadUnloadData, assemblyName);
+                                        if (j != null) j.MethodName = fullName;
 
-                                    // Console.WriteLine($"Load @ {loadUnloadData.MethodStartAddress:X16}: {fullName}");
+                                        // Console.WriteLine($"Load @ {loadUnloadData.MethodStartAddress:X16}: {fullName}");
 
-                                    // string key = fullName + "@" + loadUnloadData.MethodID.ToString("X");
-                                    string key = loadUnloadData.MethodID.ToString("X") + loadUnloadData.ReJITID;
-                                    if (!ImageMap.ContainsKey(key))
-                                    {
-                                        ImageInfo methodInfo = new ImageInfo(fullName, loadUnloadData.MethodStartAddress,
-                                           loadUnloadData.MethodSize);
-                                        ImageMap.Add(key, methodInfo);
-                                        methodInfo.IsJitGeneratedCode = true;
-                                        methodInfo.IsJittedCode = loadUnloadData.IsJitted;
-                                        methodInfo.IsRejittedCode = loadUnloadData.ReJITID > 0;
-                                        methodInfo.AssemblyId = assemblyId;
+                                        // string key = fullName + "@" + loadUnloadData.MethodID.ToString("X");
+                                        string key = loadUnloadData.MethodID.ToString("X") + loadUnloadData.ReJITID;
+                                        if (!ImageMap.ContainsKey(key))
+                                        {
+                                            ImageInfo methodInfo = new ImageInfo(fullName, loadUnloadData.MethodStartAddress,
+                                               loadUnloadData.MethodSize);
+                                            ImageMap.Add(key, methodInfo);
+                                            methodInfo.IsJitGeneratedCode = true;
+                                            methodInfo.IsJittedCode = loadUnloadData.IsJitted;
+                                            methodInfo.IsRejittedCode = loadUnloadData.ReJITID > 0;
+                                            methodInfo.AssemblyId = assemblyId;
+                                        }
+                                        else
+                                        {
+                                            Console.WriteLine($"eh? reloading method {fullName}");
+                                        }
                                     }
                                     else
                                     {
-                                        Console.WriteLine($"eh? reloading method {fullName}");
+                                        Console.WriteLine($"eh? unknown module ID {loadUnloadData.ModuleID}");
                                     }
 
                                     break;
@@ -663,35 +746,35 @@ namespace CoreClrInstRetired
                 }
             }
 
-            if (!eventCounts.ContainsKey("PerfInfo/PMCSample"))
+            if (!eventCounts.ContainsKey("PerfInfo/Sample"))
             {
-                Console.WriteLine("No PMC events seen for {0}, sorry.", benchmarkName);
+                Console.WriteLine("No profile events seen for {0}, sorry.", benchmarkName);
             }
             else
             {
                 ulong InstrsPerEvent = PMCInterval;
-                ulong pmcEvents = eventCounts["PerfInfo/PMCSample"];
+                ulong pmcEvents = eventCounts["PerfInfo/Sample"];
                 ulong JitDllSampleCount = ImageMap[jitDllKey].SampleCount;
                 ulong JitInterfaceCount = JitSampleCount - JitDllSampleCount;
 
-                Console.WriteLine("InstRetired for {0}: {1} events, {2:E} instrs",
-                    benchmarkName, pmcEvents, pmcEvents * InstrsPerEvent);
+                Console.WriteLine("Samples for {0}: {1} events, {2:E} instrs for {3}",
+                    benchmarkName, pmcEvents, pmcEvents * InstrsPerEvent, filterToBenchmark ? "Benchmark Only" : "Entire Process");
 
                 if (AllJitInvocations.Count > 0)
                 {
-                    Console.WriteLine("Jitting           : {0:00.00%} {1,-8:G3} instructions {2} methods",
+                    Console.WriteLine("Jitting           : {0:00.00%} {1,-8:G3} samples {2} methods",
                         (double)JitSampleCount / TotalSampleCount, JitSampleCount * InstrsPerEvent, AllJitInvocations.Count);
-                    Console.WriteLine("  JitInterface    : {0:00.00%} {1,-8:G3} instructions",
+                    Console.WriteLine("  JitInterface    : {0:00.00%} {1,-8:G3} samples",
                         (double)JitInterfaceCount / TotalSampleCount, JitInterfaceCount * InstrsPerEvent);
-                    Console.WriteLine("Jit-generated code: {0:00.00%} {1,-8:G3} instructions",
+                    Console.WriteLine("Jit-generated code: {0:00.00%} {1,-8:G3} samples",
                         (double)JitGeneratedCodeSampleCount / TotalSampleCount, JitGeneratedCodeSampleCount * InstrsPerEvent);
-                    Console.WriteLine("  Jitted code     : {0:00.00%} {1,-8:G3} instructions",
+                    Console.WriteLine("  Jitted code     : {0:00.00%} {1,-8:G3} samples",
                         (double)JittedCodeSampleCount / TotalSampleCount, JittedCodeSampleCount * InstrsPerEvent);
-                    Console.WriteLine("  ReJitted code     : {0:00.00%} {1,-8:G3} instructions",
+                    Console.WriteLine("  ReJitted code     : {0:00.00%} {1,-8:G3} samples",
                         (double)RejittedCodeSampleCount / TotalSampleCount, RejittedCodeSampleCount * InstrsPerEvent);
-                    Console.WriteLine("  Ngen   code     : {0:00.00%} {1,-8:G3} instructions",
+                    Console.WriteLine("  Ngen   code     : {0:00.00%} {1,-8:G3} samples",
                         (double)NgenCodeSampleCount / TotalSampleCount, NgenCodeSampleCount * InstrsPerEvent);
-                    Console.WriteLine("  R2R    code     : {0:00.00%} {1,-8:G3} instructions",
+                    Console.WriteLine("  R2R    code     : {0:00.00%} {1,-8:G3} samples",
                         (double)R2RCodeSampleCount / TotalSampleCount, R2RCodeSampleCount * InstrsPerEvent);
                     Console.WriteLine();
                 }
@@ -813,6 +896,19 @@ namespace CoreClrInstRetired
             }
 
             Console.WriteLine($"{totalJitted,32} jitted in {totalJitTime,8:F3}ms 100.00% --- TOTAL ---");
+
+            // Show BenchmarkIntervals
+            if (filterToBenchmark && (BenchmarkIntervals.Count > 0))
+            {
+                double meanInterval = BenchmarkIntervals.Select(x => x.endTimestamp - x.startTimestamp).Average();
+                Console.WriteLine();
+                Console.WriteLine($"Benchmark: found {BenchmarkIntervals.Count} intervals; mean interval {meanInterval:F3}ms");
+                int rr = 0;
+                foreach (var x in BenchmarkIntervals)
+                {
+                    Console.WriteLine($"{rr++:D3} {x.startTimestamp:F3} -- {x.endTimestamp:F3} : {x.endTimestamp - x.startTimestamp:F3}");
+                }
+            }
 
             return 0;
 
