@@ -347,6 +347,7 @@ namespace CoreClrInstRetired
                         showEvents = true;
                         break;
                     case "-benchmark":
+                        benchmarkName = "dotnet";
                         filterToBenchmark = true;
                         break;
                     default:
@@ -446,8 +447,22 @@ namespace CoreClrInstRetired
 
                                     if (benchmarkPid == -2)
                                     {
-                                        benchmarkPid = pdata.ProcessID;
-                                        ProcessStart = pdata.TimeStampRelativeMSec;
+                                        if (filterToBenchmark)
+                                        {
+                                            if (pdata.CommandLine.Contains("--benchmarkName"))
+                                            {
+                                                benchmarkPid = pdata.ProcessID;
+                                                ProcessStart = pdata.TimeStampRelativeMSec;
+                                                Console.WriteLine();
+                                                Console.WriteLine($"==> benchmark process is [{benchmarkPid}]");
+                                                Console.WriteLine();
+                                            }
+                                        }
+                                        else
+                                        {
+                                            benchmarkPid = pdata.ProcessID;
+                                            ProcessStart = pdata.TimeStampRelativeMSec;
+                                        }
                                     }
                                 }
                                 else
