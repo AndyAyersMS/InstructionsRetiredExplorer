@@ -17,9 +17,9 @@ namespace CoreClrInstRetired
         public ulong EndAddress;
         public bool IsJitGeneratedCode;
         public bool IsJittedCode;
-        public bool IsRejittedCode;
         public bool IsBackupImage;
         public long AssemblyId;
+        public int  Flags;
 
         public ImageInfo(string name, ulong baseAddress, int size)
         {
@@ -152,12 +152,28 @@ namespace CoreClrInstRetired
         public static List<BenchmarkInterval> BenchmarkIntervals = new List<BenchmarkInterval>();
         public static ulong JitSampleCount = 0;
         public static ulong TotalSampleCount = 0;
+
+        // unknown code
+        public static ulong UnknownImageSampleCount = 0;
+
+        // all managed code (jit-generated)
         public static ulong JitGeneratedCodeSampleCount = 0;
-        public static ulong RejittedCodeSampleCount = 0;
+
+        // all jitted code
         public static ulong JittedCodeSampleCount = 0;
-        public static ulong NgenCodeSampleCount = 0;
-        public static ulong R2RCodeSampleCount = 0;
-        public static ulong UnknownImageCount = 0;
+
+        // all pre-jitted code
+        public static ulong PreJittedCodeSampleCount = 0;
+
+        // categories of jitted code
+        public static ulong JitMinOptSampleCount = 0;
+        public static ulong JitFullOptSampleCount = 0;
+        public static ulong JitTier0SampleCount = 0;
+        public static ulong JitTier1SampleCount = 0;
+        public static ulong JitTier1OSRSampleCount = 0;
+        public static ulong JitMysterySampleCount = 0;
+
+
         public static ulong JittedCodeSize = 0;
         public static ulong ManagedMethodCount = 0;
         public static ulong PMCInterval = 65536;
@@ -231,7 +247,7 @@ namespace CoreClrInstRetired
                     {
                         Console.WriteLine("Can't map address {0:X} -- {1} counts", address, SampleCountMap[address]);
                     }
-                    UnknownImageCount += counts;
+                    UnknownImageSampleCount += counts;
                     continue;
                 }
 
@@ -240,29 +256,24 @@ namespace CoreClrInstRetired
                 if (image.IsJitGeneratedCode)
                 {
                     JitGeneratedCodeSampleCount += counts;
-                }
-                if (image.IsRejittedCode)
-                {
-                    RejittedCodeSampleCount += counts;
-                }
-                else if (image.IsJittedCode)
-                {
-                    JittedCodeSampleCount += counts;
-                }
-                else if (image.IsJitGeneratedCode)
-                {
-                    if (assemblyInfo.ContainsKey(image.AssemblyId))
-                    {
-                        AssemblyInfo assembly = assemblyInfo[image.AssemblyId];
 
-                        if ((assembly.Flags & AssemblyFlags.Native) != 0)
+                    if (image.IsJittedCode)
+                    {
+                        JittedCodeSampleCount++;
+
+                        switch ((image.Flags >> 7) & 0x7)
                         {
-                            NgenCodeSampleCount += counts;
+                            case 1: JitMinOptSampleCount += counts; break;
+                            case 2: JitFullOptSampleCount += counts; break;
+                            case 3: JitTier0SampleCount += counts; break;
+                            case 4: JitTier1SampleCount += counts; break;
+                            case 5: JitTier1OSRSampleCount += counts; break;
+                            default: JitMysterySampleCount += counts; break;
                         }
-                        else
-                        {
-                            R2RCodeSampleCount += counts;
-                        }                    
+                    }
+                    else
+                    {
+                        PreJittedCodeSampleCount++;
                     }
                 }
                 continue;
@@ -524,8 +535,6 @@ namespace CoreClrInstRetired
                                         {
                                             jitDllKey = fullName;
                                         }
-
-
                                     }
                                 }
 
@@ -690,11 +699,13 @@ namespace CoreClrInstRetired
                                         {
                                             ImageInfo methodInfo = new ImageInfo(fullName, loadUnloadData.MethodStartAddress,
                                                loadUnloadData.MethodSize);
-                                            ImageMap.Add(key, methodInfo);
+
                                             methodInfo.IsJitGeneratedCode = true;
                                             methodInfo.IsJittedCode = loadUnloadData.IsJitted;
-                                            methodInfo.IsRejittedCode = loadUnloadData.ReJITID > 0;
+                                            methodInfo.Flags = (int)loadUnloadData.PayloadByName("MethodFlags");
                                             methodInfo.AssemblyId = assemblyId;
+
+                                            ImageMap.Add(key, methodInfo);
                                         }
                                         else
                                         {
@@ -730,11 +741,13 @@ namespace CoreClrInstRetired
                                         // Pretend this is an "image"
                                         ImageInfo methodInfo = new ImageInfo(fullName, loadUnloadData.MethodStartAddress,
                                             loadUnloadData.MethodSize);
-                                        ImageMap.Add(key, methodInfo);
+
                                         methodInfo.IsJitGeneratedCode = true;
                                         methodInfo.IsJittedCode = loadUnloadData.IsJitted;
-                                        methodInfo.IsRejittedCode = loadUnloadData.ReJITID > 0;
+                                        methodInfo.Flags = (int)loadUnloadData.PayloadByName("MethodFlags");
                                         methodInfo.AssemblyId = assemblyId;
+
+                                        ImageMap.Add(key, methodInfo);
                                     }
                                     else
                                     {
@@ -772,7 +785,7 @@ namespace CoreClrInstRetired
                 ulong JitDllSampleCount = ImageMap[jitDllKey].SampleCount;
                 ulong JitInterfaceCount = JitSampleCount - JitDllSampleCount;
 
-                Console.WriteLine("Samples for {0}: {1} events, {2:E} instrs for {3}",
+                Console.WriteLine("Samples for {0}: {1} events, {2:E} counts for {3}",
                     benchmarkName, pmcEvents, pmcEvents * InstrsPerEvent, filterToBenchmark ? "Benchmark Only" : "Entire Process");
 
                 if (AllJitInvocations.Count > 0)
@@ -785,22 +798,31 @@ namespace CoreClrInstRetired
                         (double)JitGeneratedCodeSampleCount / TotalSampleCount, JitGeneratedCodeSampleCount * InstrsPerEvent);
                     Console.WriteLine("  Jitted code     : {0:00.00%} {1,-8:G3} samples",
                         (double)JittedCodeSampleCount / TotalSampleCount, JittedCodeSampleCount * InstrsPerEvent);
-                    Console.WriteLine("  ReJitted code     : {0:00.00%} {1,-8:G3} samples",
-                        (double)RejittedCodeSampleCount / TotalSampleCount, RejittedCodeSampleCount * InstrsPerEvent);
-                    Console.WriteLine("  Ngen   code     : {0:00.00%} {1,-8:G3} samples",
-                        (double)NgenCodeSampleCount / TotalSampleCount, NgenCodeSampleCount * InstrsPerEvent);
-                    Console.WriteLine("  R2R    code     : {0:00.00%} {1,-8:G3} samples",
-                        (double)R2RCodeSampleCount / TotalSampleCount, R2RCodeSampleCount * InstrsPerEvent);
+                    Console.WriteLine("  MinOpts code    : {0:00.00%} {1,-8:G3} samples",
+                        (double)JitMinOptSampleCount / TotalSampleCount, JitMinOptSampleCount * InstrsPerEvent);
+                    Console.WriteLine("  FullOpts code   : {0:00.00%} {1,-8:G3} samples",
+                        (double)JitFullOptSampleCount / TotalSampleCount, JitFullOptSampleCount * InstrsPerEvent);
+                    Console.WriteLine("  Tier-0s code    : {0:00.00%} {1,-8:G3} samples",
+                        (double)JitTier0SampleCount / TotalSampleCount, JitTier0SampleCount * InstrsPerEvent);
+                    Console.WriteLine("  Tier-1s code    : {0:00.00%} {1,-8:G3} samples",
+                        (double)JitTier1SampleCount / TotalSampleCount, JitTier1SampleCount * InstrsPerEvent);
+                    Console.WriteLine("  R2R code        : {0:00.00%} {1,-8:G3} samples",
+                        (double)PreJittedCodeSampleCount / TotalSampleCount, PreJittedCodeSampleCount * InstrsPerEvent);
+                    if (JitMysterySampleCount > 0)
+                    {
+                        Console.WriteLine("  ???     code    : {0:00.00%} {1,-8:G3} samples",
+                            (double)JitMysterySampleCount / TotalSampleCount, JitMysterySampleCount * InstrsPerEvent);
+                    }
                     Console.WriteLine();
                 }
 
-                double ufrac = (double)UnknownImageCount / TotalSampleCount;
+                double ufrac = (double)UnknownImageSampleCount / TotalSampleCount;
                 if (ufrac > 0.002)
                 {
                     Console.WriteLine("{0:00.00%}   {1,-8:G3}    {2} {3}",
                         ufrac,
-                        UnknownImageCount * InstrsPerEvent,
-                        "?      ",
+                        UnknownImageSampleCount * InstrsPerEvent,
+                        "?       ",
                         "Unknown");
                 }
 
@@ -820,97 +842,124 @@ namespace CoreClrInstRetired
 
                 foreach (var i in significantInfos)
                 {
+                    string codeDesc = "native ";
+
+                    if (i.IsJitGeneratedCode)
+                    {
+                        if (i.IsJittedCode)
+                        {
+                            switch ((i.Flags >> 7) & 0x7)
+                            {
+                                case 1: codeDesc = "MinOpt "; break;
+                                case 2: codeDesc = "FullOpt"; break;
+                                case 3: codeDesc = "Tier-0 "; break;
+                                case 4: codeDesc = "Tier-1 "; break;
+                                case 5: codeDesc = "OSR    "; break;
+                                default: codeDesc = "jit ???"; break;
+                            }
+                        }
+                        else
+                        {
+                            codeDesc = "R2R";
+                        }
+                    }
                     Console.WriteLine("{0:00.00%}   {1,-9:G4}   {2}  {3}",
                         (double)i.SampleCount / TotalSampleCount,
-                        i.SampleCount * InstrsPerEvent,
-                        i.IsJitGeneratedCode ? (i.IsJittedCode ? (i.IsRejittedCode ? "rejit " : "jit   ") : "prejit") : "native",
+                        i.SampleCount * InstrsPerEvent, codeDesc,
                         i.Name);
                 }
 
-                // Show significant jit invocations (samples)
-                AllJitInvocations.Sort(JitInvocation.MoreJitInstructions);
-                bool printed = false;
-                ulong signficantCount = (5 * JitSampleCount) / 1000;
-                foreach (var j in AllJitInvocations)
+                bool showJitTime = false;
+
+                if (showJitTime)
                 {
-                    ulong totalCount = j.JitInstrs();
-                    if (totalCount > signficantCount)
+
+                    // Show significant jit invocations (samples)
+                    AllJitInvocations.Sort(JitInvocation.MoreJitInstructions);
+                    bool printed = false;
+                    ulong signficantCount = (5 * JitSampleCount) / 1000;
+                    foreach (var j in AllJitInvocations)
                     {
-                        if (!printed)
+                        ulong totalCount = j.JitInstrs();
+                        if (totalCount > signficantCount)
                         {
-                            Console.WriteLine();
-                            Console.WriteLine("Slow jitting methods (anything taking more than 0.5% of total samples)");
-                            printed = true;
+                            if (!printed)
+                            {
+                                Console.WriteLine();
+                                Console.WriteLine("Slow jitting methods (anything taking more than 0.5% of total samples)");
+                                printed = true;
+                            }
+                            Console.WriteLine("{0:00.00%}    {1,-9:G4} {2}", (double)totalCount / TotalSampleCount, totalCount * InstrsPerEvent, j.MethodName);
                         }
-                        Console.WriteLine("{0:00.00%}    {1,-9:G4} {2}", (double)totalCount / TotalSampleCount, totalCount * InstrsPerEvent, j.MethodName);
                     }
+
+                    Console.WriteLine();
+                    double totalJitTime = AllJitInvocations.Sum(j => j.JitTime());
+                    Console.WriteLine($"Total jit time: {totalJitTime:F2}ms {AllJitInvocations.Count} methods {totalJitTime / AllJitInvocations.Count:F2}ms avg");
+
+                    // Show 10 slowest jit invocations (time, ms)
+                    AllJitInvocations.Sort(JitInvocation.MoreJitTime);
+                    Console.WriteLine();
+                    Console.WriteLine($"Slow jitting methods (time)");
+                    int kLimit = 10;
+                    for (int k = 0; k < kLimit; k++)
+                    {
+                        if (k < AllJitInvocations.Count)
+                        {
+                            JitInvocation j = AllJitInvocations[k];
+                            Console.WriteLine($"{j.JitTime(),6:F2} {j.MethodName} starting at {j.InitialTimestamp,6:F2}");
+                        }
+                    }
+
+                    // Show data on cumulative distribution of jit times.
+                    if (AllJitInvocations.Count > 0)
+                    {
+                        Console.WriteLine();
+                        Console.WriteLine("Jit time percentiles");
+                        for (int percentile = 10; percentile <= 100; percentile += 10)
+                        {
+                            int pIndex = (AllJitInvocations.Count * (100 - percentile)) / 100;
+                            JitInvocation p = AllJitInvocations[pIndex];
+                            Console.WriteLine($"{percentile,3:D}%ile jit time is {p.JitTime():F3}ms");
+                        }
+                    }
+
+
+                    // Show assembly inventory
+                    // Would be nice to have counts of jitted/prejitted per assembly, order by total number of methods somehow
+                    Console.WriteLine();
+                    Console.WriteLine("Per Assembly Jitting Details");
+                    int totalJitted = 0;
+                    foreach (var assemblyId in assemblyInfo.Keys)
+                    {
+                        AssemblyInfo info = assemblyInfo[assemblyId];
+
+                        bool isNative = (info.Flags & AssemblyFlags.Native) != 0;
+                        bool isDynamic = (info.Flags & AssemblyFlags.Dynamic) != 0;
+
+                        info.NumberPrejitted = ImageMap.Where(x => x.Value.AssemblyId == assemblyId && x.Value.IsJitGeneratedCode && !x.Value.IsJittedCode).Count();
+                        info.NumberJitted = ImageMap.Where(x => x.Value.AssemblyId == assemblyId && x.Value.IsJitGeneratedCode && x.Value.IsJittedCode).Count();
+
+                        if (info.NumberJitted > 0)
+                        {
+                            info.TimeJitting = AllJitInvocations.Where(x => x.AssemblyId == assemblyId).Sum(x => x.JitTime());
+                        }
+                        info.CodegenKind = isNative ? " [NGEN]" : info.NumberPrejitted > 0 ? " [R2R]" : isDynamic ? " [DYNAMIC]" : " [JITTED]";
+
+                        totalJitted += info.NumberJitted;
+                    }
+
+                    foreach (var x in assemblyInfo.Values.OrderByDescending(x => x.TimeJitting))
+                    {
+                        if (x.NumberJitted > 0)
+                        {
+                            Console.WriteLine($"{x.CodegenKind,10} {x.NumberPrejitted,5} prejitted {x.NumberJitted,5} jitted in {x.TimeJitting,8:F3}ms {100 * x.TimeJitting / totalJitTime,6:F2}% {x.Name} ");
+                        }
+                    }
+
+                    Console.WriteLine($"{totalJitted,32} jitted in {totalJitTime,8:F3}ms 100.00% --- TOTAL ---");
                 }
             }
-
-            Console.WriteLine();
-            double totalJitTime = AllJitInvocations.Sum(j => j.JitTime());
-            Console.WriteLine($"Total jit time: {totalJitTime:F2}ms {AllJitInvocations.Count} methods {totalJitTime / AllJitInvocations.Count:F2}ms avg");
-
-            // Show 10 slowest jit invocations (time, ms)
-            AllJitInvocations.Sort(JitInvocation.MoreJitTime);
-            Console.WriteLine();
-            Console.WriteLine($"Slow jitting methods (time)");
-            int kLimit = 10;
-            for (int k = 0; k < kLimit; k++)
-            {
-                if (k < AllJitInvocations.Count)
-                {
-                    JitInvocation j = AllJitInvocations[k];
-                    Console.WriteLine($"{j.JitTime(),6:F2} {j.MethodName} starting at {j.InitialTimestamp,6:F2}");
-                }
-            }
-
-            // Show data on cumulative distribution of jit times.
-            if (AllJitInvocations.Count > 0)
-            {
-                Console.WriteLine();
-                Console.WriteLine("Jit time percentiles");
-                for (int percentile = 10; percentile <= 100; percentile += 10)
-                {
-                    int pIndex = (AllJitInvocations.Count * (100 - percentile)) / 100;
-                    JitInvocation p = AllJitInvocations[pIndex];
-                    Console.WriteLine($"{percentile,3:D}%ile jit time is {p.JitTime():F3}ms");
-                }
-            }
-
-            // Show assembly inventory
-            // Would be nice to have counts of jitted/prejitted per assembly, order by total number of methods somehow
-            Console.WriteLine();
-            Console.WriteLine("Per Assembly Jitting Details");
-            int totalJitted = 0;
-            foreach (var assemblyId in assemblyInfo.Keys)
-            {
-                AssemblyInfo info = assemblyInfo[assemblyId];
-
-                bool isNative = (info.Flags & AssemblyFlags.Native) != 0;
-                bool isDynamic = (info.Flags & AssemblyFlags.Dynamic) != 0;
-
-                info.NumberPrejitted = ImageMap.Where(x => x.Value.AssemblyId == assemblyId && x.Value.IsJitGeneratedCode && !x.Value.IsJittedCode).Count();
-                info.NumberJitted = ImageMap.Where(x => x.Value.AssemblyId == assemblyId && x.Value.IsJitGeneratedCode && x.Value.IsJittedCode).Count();
-
-                if (info.NumberJitted > 0)
-                {
-                    info.TimeJitting = AllJitInvocations.Where(x => x.AssemblyId == assemblyId).Sum(x => x.JitTime());
-                }
-                info.CodegenKind = isNative ? " [NGEN]" : info.NumberPrejitted > 0 ? " [R2R]" : isDynamic ? " [DYNAMIC]" : " [JITTED]";
-
-                totalJitted += info.NumberJitted;
-            }
-
-            foreach (var x in assemblyInfo.Values.OrderByDescending(x => x.TimeJitting))
-            {
-                if (x.NumberJitted > 0)
-                {
-                    Console.WriteLine($"{x.CodegenKind,10} {x.NumberPrejitted,5} prejitted {x.NumberJitted,5} jitted in {x.TimeJitting,8:F3}ms {100 * x.TimeJitting / totalJitTime,6:F2}% {x.Name} ");
-                }
-            }
-
-            Console.WriteLine($"{totalJitted,32} jitted in {totalJitTime,8:F3}ms 100.00% --- TOTAL ---");
 
             // Show BenchmarkIntervals
             if (filterToBenchmark && (BenchmarkIntervals.Count > 0))
@@ -918,10 +967,14 @@ namespace CoreClrInstRetired
                 double meanInterval = BenchmarkIntervals.Select(x => x.endTimestamp - x.startTimestamp).Average();
                 Console.WriteLine();
                 Console.WriteLine($"Benchmark: found {BenchmarkIntervals.Count} intervals; mean interval {meanInterval:F3}ms");
-                int rr = 0;
-                foreach (var x in BenchmarkIntervals)
+                bool showIntervals = false;
+                if (showIntervals)
                 {
-                    Console.WriteLine($"{rr++:D3} {x.startTimestamp:F3} -- {x.endTimestamp:F3} : {x.endTimestamp - x.startTimestamp:F3}");
+                    int rr = 0;
+                    foreach (var x in BenchmarkIntervals)
+                    {
+                        Console.WriteLine($"{rr++:D3} {x.startTimestamp:F3} -- {x.endTimestamp:F3} : {x.endTimestamp - x.startTimestamp:F3}");
+                    }
                 }
             }
 
