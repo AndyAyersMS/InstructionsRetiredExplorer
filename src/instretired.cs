@@ -6,6 +6,29 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 
+// tracelog.exe -profilesources Help
+//
+//Id Name                        Interval  Min      Max
+//--------------------------------------------------------------
+//  0 Timer                          10000  1221    1000000
+//  2 TotalIssues                    65536  4096 2147483647
+//  6 BranchInstructions             65536  4096 2147483647
+// 10 CacheMisses                    65536  4096 2147483647
+// 11 BranchMispredictions           65536  4096 2147483647
+// 19 TotalCycles                    65536  4096 2147483647
+// 25 UnhaltedCoreCycles             65536  4096 2147483647
+// 26 InstructionRetired           1000000  4096 2147483647
+// 27 UnhaltedReferenceCycles        65536  4096 2147483647
+// 28 LLCReference                   65536  4096 2147483647
+// 29 LLCMisses                      65536  4096 2147483647
+// 30 BranchInstructionRetired       65536  4096 2147483647
+// 31 BranchMispredictsRetired       65536  4096 2147483647
+// 32 LbrInserts                     65536  4096 2147483647
+// 33 InstructionsRetiredFixed       65536  4096 2147483647
+// 34 UnhaltedCoreCyclesFixed        65536  4096 2147483647
+// 35 UnhaltedReferenceCyclesFixed      65536  4096 2147483647
+// 36 TimerFixed                     10000  1221    1000000
+
 namespace CoreClrInstRetired
 {
     public class ImageInfo
@@ -259,7 +282,7 @@ namespace CoreClrInstRetired
 
                     if (image.IsJittedCode)
                     {
-                        JittedCodeSampleCount++;
+                        JittedCodeSampleCount += counts;
 
                         switch ((image.Flags >> 7) & 0x7)
                         {
@@ -273,7 +296,7 @@ namespace CoreClrInstRetired
                     }
                     else
                     {
-                        PreJittedCodeSampleCount++;
+                        PreJittedCodeSampleCount += counts;
                     }
                 }
                 continue;
@@ -302,31 +325,25 @@ namespace CoreClrInstRetired
             return assembly + className + sep + data.MethodName + sig;
         }
 
-        public static int Main(string[] args)
+        public static void Main(string[] args)
         {
-            if (args.Length < 1 || args.Length > 4)
+            if (args.Length < 1)
             {
-                Console.WriteLine("Usage: instretired file.etl [-process process-name] [-pid pid] [-show-events]");
-                Console.WriteLine("   process defaults to corerun");
-                return -1;
+                Usage();
+                return;
             }
 
-            string traceFile = args[0];
-
-            if (!File.Exists(traceFile))
-            {
-                Console.WriteLine($"Can't find trace file '{traceFile}'");
-                return -1;
-            }
-
-            string benchmarkName = "corerun";
+            string traceFile = null;
+            string benchmarkName = null;
             bool showEvents = false;
+            bool showJitTimes = false;
             bool filterToBenchmark = false;
+            bool instructionsRetired = false;
             BenchmarkInterval benchmarkInterval = null;
             int targetPid = -2;
             int benchmarkPid = -2;
 
-            for (int i = 1; i < args.Length; i++)
+            for (int i = 0; i < args.Length; i++)
             {
                 switch (args[i])
                 {
@@ -357,17 +374,48 @@ namespace CoreClrInstRetired
                     case "-show-events":
                         showEvents = true;
                         break;
+                    case "-show-jit-times":
+                        showJitTimes = true;
+                        break;
+                    case "-instructions-retired":
+                        instructionsRetired = true;
+                        break;
                     case "-benchmark":
-                        benchmarkName = "dotnet";
+                        if (benchmarkName == null)
+                        {
+                            benchmarkName = "dotnet";
+                        }
                         filterToBenchmark = true;
                         break;
                     default:
-                        Console.WriteLine($"Unknown arg '{args[i]}'");
-                        return -1;
+                        if (args[i].StartsWith("-"))
+                        {
+                            Usage();
+                            return;
+                        }
+                        traceFile = args[i];
+                        break;
                 }
             }
 
-            Console.WriteLine("Mining ETL from {0} for process {1}", traceFile, benchmarkName);
+            if (traceFile == null)
+            {
+                Console.WriteLine($"Must specify trace file");
+                return;
+            }
+
+            if (!File.Exists(traceFile))
+            {
+                Console.WriteLine($"Can't find trace file '{traceFile}'");
+                return;
+            }
+
+            if (benchmarkName == null)
+            {
+                benchmarkName = "corerun";
+            }
+
+            Console.WriteLine($"Mining ETL from {traceFile} for process {benchmarkName}");
 
             Dictionary<string, uint> allEventCounts = new Dictionary<string, uint>();
             Dictionary<string, uint> eventCounts = new Dictionary<string, uint>();
@@ -544,7 +592,7 @@ namespace CoreClrInstRetired
                         case "PerfInfo/Sample":
                             {
                                 SampledProfileTraceData traceData = (SampledProfileTraceData)data;
-                                if (traceData.ProcessID == benchmarkPid)
+                                if ((traceData.ProcessID == benchmarkPid) && !instructionsRetired)
                                 {
                                     if (!filterToBenchmark ||(benchmarkInterval != null))
                                     {
@@ -559,8 +607,10 @@ namespace CoreClrInstRetired
 
                         case "PerfInfo/PMCSample":
                             {
+                                // Per above, sample ID 26 is instructions retired
+                                //
                                 PMCCounterProfTraceData traceData = (PMCCounterProfTraceData)data;
-                                if (traceData.ProcessID == benchmarkPid)
+                                if (instructionsRetired && (traceData.ProcessID == benchmarkPid) && (traceData.ProfileSource == 26))
                                 {
                                     if (!filterToBenchmark || (benchmarkInterval != null))
                                     {
@@ -714,7 +764,7 @@ namespace CoreClrInstRetired
                                     }
                                     else
                                     {
-                                        Console.WriteLine($"eh? unknown module ID {loadUnloadData.ModuleID}");
+                                        // Console.WriteLine($"eh? unknown module ID {loadUnloadData.ModuleID}");
                                     }
 
                                     break;
@@ -774,54 +824,55 @@ namespace CoreClrInstRetired
                 }
             }
 
-            if (!eventCounts.ContainsKey("PerfInfo/Sample"))
+            string eventToSummarize = instructionsRetired ? "PerfInfo/PMCSample" : "PerfInfo/Sample";
+            string eventName = instructionsRetired ? "Instructions" : "Samples";
+            string summaryType = filterToBenchmark ? "Benchmark Intervals" : "Entire Process";
+
+            if (!eventCounts.ContainsKey(eventToSummarize))
             {
-                Console.WriteLine("No profile events seen for {0}, sorry.", benchmarkName);
+                Console.WriteLine($"No {eventName} events seen for {benchmarkName}.");
             }
             else
             {
-                ulong InstrsPerEvent = PMCInterval;
-                ulong pmcEvents = eventCounts["PerfInfo/Sample"];
+                ulong CountsPerEvent = 1; // review
+                ulong eventCount = eventCounts[eventToSummarize];
                 ulong JitDllSampleCount = ImageMap[jitDllKey].SampleCount;
                 ulong JitInterfaceCount = JitSampleCount - JitDllSampleCount;
 
-                Console.WriteLine("Samples for {0}: {1} events, {2:E} counts for {3}",
-                    benchmarkName, pmcEvents, pmcEvents * InstrsPerEvent, filterToBenchmark ? "Benchmark Only" : "Entire Process");
+                Console.WriteLine($"{eventName} for {benchmarkName}: {eventCount} events for {summaryType}");
 
-                if (AllJitInvocations.Count > 0)
+                Console.WriteLine("Jitting           : {0:00.00%} {1,-8:G3} samples {2} methods",
+                    (double)JitSampleCount / TotalSampleCount, JitSampleCount * CountsPerEvent, AllJitInvocations.Count);
+                Console.WriteLine("  JitInterface    : {0:00.00%} {1,-8:G3} samples",
+                    (double)JitInterfaceCount / TotalSampleCount, JitInterfaceCount * CountsPerEvent);
+                Console.WriteLine("Jit-generated code: {0:00.00%} {1,-8:G3} samples",
+                    (double)JitGeneratedCodeSampleCount / TotalSampleCount, JitGeneratedCodeSampleCount * CountsPerEvent);
+                Console.WriteLine("  Jitted code     : {0:00.00%} {1,-8:G3} samples",
+                    (double)JittedCodeSampleCount / TotalSampleCount, JittedCodeSampleCount * CountsPerEvent);
+                Console.WriteLine("  MinOpts code    : {0:00.00%} {1,-8:G3} samples",
+                    (double)JitMinOptSampleCount / TotalSampleCount, JitMinOptSampleCount * CountsPerEvent);
+                Console.WriteLine("  FullOpts code   : {0:00.00%} {1,-8:G3} samples",
+                    (double)JitFullOptSampleCount / TotalSampleCount, JitFullOptSampleCount * CountsPerEvent);
+                Console.WriteLine("  Tier-0 code     : {0:00.00%} {1,-8:G3} samples",
+                    (double)JitTier0SampleCount / TotalSampleCount, JitTier0SampleCount * CountsPerEvent);
+                Console.WriteLine("  Tier-1 code     : {0:00.00%} {1,-8:G3} samples",
+                    (double)JitTier1SampleCount / TotalSampleCount, JitTier1SampleCount * CountsPerEvent);
+                Console.WriteLine("  R2R code        : {0:00.00%} {1,-8:G3} samples",
+                    (double)PreJittedCodeSampleCount / TotalSampleCount, PreJittedCodeSampleCount * CountsPerEvent);
+
+                if (JitMysterySampleCount > 0)
                 {
-                    Console.WriteLine("Jitting           : {0:00.00%} {1,-8:G3} samples {2} methods",
-                        (double)JitSampleCount / TotalSampleCount, JitSampleCount * InstrsPerEvent, AllJitInvocations.Count);
-                    Console.WriteLine("  JitInterface    : {0:00.00%} {1,-8:G3} samples",
-                        (double)JitInterfaceCount / TotalSampleCount, JitInterfaceCount * InstrsPerEvent);
-                    Console.WriteLine("Jit-generated code: {0:00.00%} {1,-8:G3} samples",
-                        (double)JitGeneratedCodeSampleCount / TotalSampleCount, JitGeneratedCodeSampleCount * InstrsPerEvent);
-                    Console.WriteLine("  Jitted code     : {0:00.00%} {1,-8:G3} samples",
-                        (double)JittedCodeSampleCount / TotalSampleCount, JittedCodeSampleCount * InstrsPerEvent);
-                    Console.WriteLine("  MinOpts code    : {0:00.00%} {1,-8:G3} samples",
-                        (double)JitMinOptSampleCount / TotalSampleCount, JitMinOptSampleCount * InstrsPerEvent);
-                    Console.WriteLine("  FullOpts code   : {0:00.00%} {1,-8:G3} samples",
-                        (double)JitFullOptSampleCount / TotalSampleCount, JitFullOptSampleCount * InstrsPerEvent);
-                    Console.WriteLine("  Tier-0s code    : {0:00.00%} {1,-8:G3} samples",
-                        (double)JitTier0SampleCount / TotalSampleCount, JitTier0SampleCount * InstrsPerEvent);
-                    Console.WriteLine("  Tier-1s code    : {0:00.00%} {1,-8:G3} samples",
-                        (double)JitTier1SampleCount / TotalSampleCount, JitTier1SampleCount * InstrsPerEvent);
-                    Console.WriteLine("  R2R code        : {0:00.00%} {1,-8:G3} samples",
-                        (double)PreJittedCodeSampleCount / TotalSampleCount, PreJittedCodeSampleCount * InstrsPerEvent);
-                    if (JitMysterySampleCount > 0)
-                    {
-                        Console.WriteLine("  ???     code    : {0:00.00%} {1,-8:G3} samples",
-                            (double)JitMysterySampleCount / TotalSampleCount, JitMysterySampleCount * InstrsPerEvent);
-                    }
-                    Console.WriteLine();
+                    Console.WriteLine("  ???     code    : {0:00.00%} {1,-8:G3} samples",
+                        (double)JitMysterySampleCount / TotalSampleCount, JitMysterySampleCount * CountsPerEvent);
                 }
+                Console.WriteLine();
 
                 double ufrac = (double)UnknownImageSampleCount / TotalSampleCount;
                 if (ufrac > 0.002)
                 {
                     Console.WriteLine("{0:00.00%}   {1,-8:G3}    {2} {3}",
                         ufrac,
-                        UnknownImageSampleCount * InstrsPerEvent,
+                        UnknownImageSampleCount * CountsPerEvent,
                         "?       ",
                         "Unknown");
                 }
@@ -865,15 +916,12 @@ namespace CoreClrInstRetired
                     }
                     Console.WriteLine("{0:00.00%}   {1,-9:G4}   {2}  {3}",
                         (double)i.SampleCount / TotalSampleCount,
-                        i.SampleCount * InstrsPerEvent, codeDesc,
+                        i.SampleCount * CountsPerEvent, codeDesc,
                         i.Name);
                 }
 
-                bool showJitTime = false;
-
-                if (showJitTime)
+                if (showJitTimes)
                 {
-
                     // Show significant jit invocations (samples)
                     AllJitInvocations.Sort(JitInvocation.MoreJitInstructions);
                     bool printed = false;
@@ -889,7 +937,7 @@ namespace CoreClrInstRetired
                                 Console.WriteLine("Slow jitting methods (anything taking more than 0.5% of total samples)");
                                 printed = true;
                             }
-                            Console.WriteLine("{0:00.00%}    {1,-9:G4} {2}", (double)totalCount / TotalSampleCount, totalCount * InstrsPerEvent, j.MethodName);
+                            Console.WriteLine("{0:00.00%}    {1,-9:G4} {2}", (double)totalCount / TotalSampleCount, totalCount * CountsPerEvent, j.MethodName);
                         }
                     }
 
@@ -978,8 +1026,18 @@ namespace CoreClrInstRetired
                 }
             }
 
-            return 0;
-
+            void Usage()
+            {
+                Console.WriteLine("Summarize profile sample data in an ETL file");
+                Console.WriteLine();
+                Console.WriteLine("Usage: -- file.etl [-process process-name] [-pid pid] [-show-events] [-show-jit-times] [-benchmark] [-instructions-retired]");
+                Console.WriteLine("   -process: defaults to corerun");
+                Console.WriteLine("   -pid: choose process to summarize via ID");
+                Console.WriteLine("   -benchmark: only count samples made during BechmarkDotNet intervals. Changes default process to dotnet");
+                Console.WriteLine("   -show-events: show counts of raw ETL events");
+                Console.WriteLine("   -show-jit-times: summarize data on time spent jitting");
+                Console.WriteLine("   -instructions-retired: if ETL has instructions retired events, summarize those instead of profile samples");
+            }
         }
     }
 }
