@@ -42,7 +42,7 @@ namespace CoreClrInstRetired
         public bool IsJittedCode;
         public bool IsBackupImage;
         public long AssemblyId;
-        public int  Flags;
+        public int Flags;
 
         public ImageInfo(string name, ulong baseAddress, int size)
         {
@@ -204,6 +204,8 @@ namespace CoreClrInstRetired
         public static double ProcessStart;
         public static double ProcessEnd;
 
+        public static string samplePattern;
+
         static void UpdateSampleCountMap(ulong address, ulong count)
         {
             if (!SampleCountMap.ContainsKey(address))
@@ -274,6 +276,8 @@ namespace CoreClrInstRetired
                     continue;
                 }
 
+                // Console.WriteLine($"{counts} counts for image {image.Name} at {address:X16}");
+
                 image.SampleCount += counts;
 
                 if (image.IsJitGeneratedCode)
@@ -342,6 +346,7 @@ namespace CoreClrInstRetired
             BenchmarkInterval benchmarkInterval = null;
             int targetPid = -2;
             int benchmarkPid = -2;
+            bool isPartialProcess = false;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -368,6 +373,17 @@ namespace CoreClrInstRetired
                             {
                                 Console.WriteLine($"Can't parse `{args[i + 1]}` as pid value");
                             }
+                            i++;
+                        }
+                        break;
+                    case "-show-samples":
+                        {
+                            if (i + 1 == args.Length)
+                            {
+                                Console.WriteLine($"Missing pattern value after '{args[i]}'");
+                            }
+                            samplePattern = args[i + 1];
+                            Console.WriteLine($"Will show samples for methods matching `{samplePattern}`");
                             i++;
                         }
                         break;
@@ -500,18 +516,20 @@ namespace CoreClrInstRetired
                                 // Process was running when tracing started (DCStart)
                                 // or started when tracing was running (Start)
                                 ProcessTraceData pdata = (ProcessTraceData)data;
-                                if (pdata.ProcessID == targetPid || String.Equals(pdata.ProcessName, benchmarkName, StringComparison.OrdinalIgnoreCase))
-                                {
-                                    Console.WriteLine("Found process [{0}] {1}: {2}", pdata.ProcessID, pdata.ProcessName, pdata.CommandLine);
 
-                                    if (benchmarkPid == -2)
+                                if (benchmarkPid == -2)
+                                {
+                                    if (pdata.ProcessID == targetPid || String.Equals(pdata.ProcessName, benchmarkName, StringComparison.OrdinalIgnoreCase))
                                     {
+                                        Console.WriteLine("Found process [{0}] {1}: {2}", pdata.ProcessID, pdata.ProcessName, pdata.CommandLine);
+
                                         if (filterToBenchmark)
                                         {
                                             if (pdata.CommandLine.Contains("--benchmarkName"))
                                             {
                                                 benchmarkPid = pdata.ProcessID;
                                                 ProcessStart = pdata.TimeStampRelativeMSec;
+                                                isPartialProcess = data.EventName.Equals("Process/DCStart");
                                                 Console.WriteLine();
                                                 Console.WriteLine($"==> benchmark process is [{benchmarkPid}]");
                                                 Console.WriteLine();
@@ -521,12 +539,18 @@ namespace CoreClrInstRetired
                                         {
                                             benchmarkPid = pdata.ProcessID;
                                             ProcessStart = pdata.TimeStampRelativeMSec;
+                                            benchmarkName = pdata.ProcessName;
+                                            isPartialProcess = data.EventName.Equals("Process/DCStart");
+
+                                            Console.WriteLine();
+                                            Console.WriteLine($"==> benchmark process is [{benchmarkPid}]");
+                                            Console.WriteLine();
                                         }
                                     }
                                 }
-                                else
+                                else if (String.Equals(pdata.ProcessName, benchmarkName, StringComparison.OrdinalIgnoreCase))
                                 {
-                                    // Console.WriteLine("Ignoring events from process {0}", pdata.ProcessName);
+                                    Console.WriteLine("Ignoring events from process [{0}] {1}: {2}", pdata.ProcessID, pdata.ProcessName, pdata.CommandLine);
                                 }
                                 break;
                             }
@@ -566,6 +590,8 @@ namespace CoreClrInstRetired
                                     // Hackily suppress ngen images here, otherwise we lose visibility
                                     // into ngen methods...
 
+                                    // Console.WriteLine($"Image 0x{imageBase:X16} for 0x{imageSize:X} bytes: {fileName}");
+
                                     string fullName = fileName + "@" + imageBase.ToString();
 
                                     if (!ImageMap.ContainsKey(fullName))
@@ -574,7 +600,7 @@ namespace CoreClrInstRetired
 
                                         if (fileName.Contains("Microsoft.") || fileName.Contains("System.") || fileName.Contains("Newtonsoft."))
                                         {
-                                            // imageInfo.IsBackupImage = true;
+                                            imageInfo.IsBackupImage = true;
                                         }
 
                                         ImageMap.Add(fullName, imageInfo);
@@ -594,7 +620,7 @@ namespace CoreClrInstRetired
                                 SampledProfileTraceData traceData = (SampledProfileTraceData)data;
                                 if ((traceData.ProcessID == benchmarkPid) && !instructionsRetired)
                                 {
-                                    if (!filterToBenchmark ||(benchmarkInterval != null))
+                                    if (!filterToBenchmark || (benchmarkInterval != null))
                                     {
                                         ulong instructionPointer = traceData.InstructionPointer;
                                         ulong count = PMCInterval;
@@ -724,7 +750,7 @@ namespace CoreClrInstRetired
                                     }
                                     else
                                     {
-                                        // ?
+                                        // Console.WriteLine("eh? no active jit for load verbose?");                                   
                                     }
 
                                     // Pretend this is an "image"
@@ -741,7 +767,7 @@ namespace CoreClrInstRetired
                                         string fullName = GetName(loadUnloadData, assemblyName);
                                         if (j != null) j.MethodName = fullName;
 
-                                        // Console.WriteLine($"Load @ {loadUnloadData.MethodStartAddress:X16}: {fullName}");
+                                        // Console.WriteLine($"Method 0x{loadUnloadData.MethodStartAddress:X16} for 0x{loadUnloadData.MethodSize:X} bytes: {fullName}");
 
                                         // string key = fullName + "@" + loadUnloadData.MethodID.ToString("X");
                                         string key = loadUnloadData.MethodID.ToString("X") + loadUnloadData.ReJITID;
@@ -764,7 +790,7 @@ namespace CoreClrInstRetired
                                     }
                                     else
                                     {
-                                        // Console.WriteLine($"eh? unknown module ID {loadUnloadData.ModuleID}");
+                                        Console.WriteLine($"eh? unknown module ID {loadUnloadData.ModuleID}");
                                     }
 
                                     break;
@@ -818,7 +844,7 @@ namespace CoreClrInstRetired
             {
                 Console.WriteLine("Event Breakdown");
 
-                foreach (var e in allEventCounts)
+                foreach (var e in eventCounts)
                 {
                     Console.WriteLine("Event {0} occurred {1} times", e.Key, e.Value);
                 }
@@ -826,7 +852,9 @@ namespace CoreClrInstRetired
 
             string eventToSummarize = instructionsRetired ? "PerfInfo/PMCSample" : "PerfInfo/Sample";
             string eventName = instructionsRetired ? "Instructions" : "Samples";
-            string summaryType = filterToBenchmark ? "Benchmark Intervals" : "Entire Process";
+            string summaryType = filterToBenchmark ? "Benchmark Intervals" : "Process";
+
+            if (isPartialProcess) summaryType += " (partial)";
 
             if (!eventCounts.ContainsKey(eventToSummarize))
             {
@@ -836,7 +864,7 @@ namespace CoreClrInstRetired
             {
                 ulong CountsPerEvent = 1; // review
                 ulong eventCount = eventCounts[eventToSummarize];
-                ulong JitDllSampleCount = ImageMap[jitDllKey].SampleCount;
+                ulong JitDllSampleCount = jitDllKey == null ? 0 : ImageMap[jitDllKey].SampleCount;
                 ulong JitInterfaceCount = JitSampleCount - JitDllSampleCount;
 
                 Console.WriteLine($"{eventName} for {benchmarkName}: {eventCount} events for {summaryType}");
@@ -1007,6 +1035,26 @@ namespace CoreClrInstRetired
 
                     Console.WriteLine($"{totalJitted,32} jitted in {totalJitTime,8:F3}ms 100.00% --- TOTAL ---");
                 }
+
+                if (samplePattern != null)
+                {
+                    foreach (var i in ImageMap)
+                    {
+                        if (i.Key.Contains(samplePattern))
+                        {
+                            ImageInfo info = i.Value;
+                            Console.WriteLine("Raw samples for {info.Name} at 0x{info.BaseAddress:X16} -- 0x{info.EndAddress:X16} (length 0x{info.EndAddress - info.BaseAddress}:4X)");
+
+                            foreach (ulong address in SampleCountMap.Keys)
+                            {
+                                if ((address >= info.BaseAddress) && (address <= info.EndAddress))
+                                {
+                                    Console.WriteLine("0x{address - info.BaseAddress:4X} : {SampleCountMap[address]}");
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Show BenchmarkIntervals
@@ -1025,19 +1073,20 @@ namespace CoreClrInstRetired
                     }
                 }
             }
+        }
 
-            void Usage()
-            {
-                Console.WriteLine("Summarize profile sample data in an ETL file");
-                Console.WriteLine();
-                Console.WriteLine("Usage: -- file.etl [-process process-name] [-pid pid] [-show-events] [-show-jit-times] [-benchmark] [-instructions-retired]");
-                Console.WriteLine("   -process: defaults to corerun");
-                Console.WriteLine("   -pid: choose process to summarize via ID");
-                Console.WriteLine("   -benchmark: only count samples made during BechmarkDotNet intervals. Changes default process to dotnet");
-                Console.WriteLine("   -show-events: show counts of raw ETL events");
-                Console.WriteLine("   -show-jit-times: summarize data on time spent jitting");
-                Console.WriteLine("   -instructions-retired: if ETL has instructions retired events, summarize those instead of profile samples");
-            }
+        static void Usage()
+        {
+            Console.WriteLine("Summarize profile sample data in an ETL file");
+            Console.WriteLine();
+            Console.WriteLine("Usage: -- file.etl [-process process-name] [-pid pid] [-show-events] [-show-jit-times] [-benchmark] [-instructions-retired]");
+            Console.WriteLine("   -process: defaults to corerun");
+            Console.WriteLine("   -pid: choose process to summarize via ID");
+            Console.WriteLine("   -benchmark: only count samples made during BechmarkDotNet intervals. Changes default process to dotnet");
+            Console.WriteLine("   -show-events: show counts of raw ETL events");
+            Console.WriteLine("   -show-jit-times: summarize data on time spent jitting");
+            Console.WriteLine("   -show-samples <pattern>: show raw method-relative hits for some methods");
+            Console.WriteLine("   -instructions-retired: if ETL has instructions retired events, summarize those instead of profile samples");
         }
     }
 }
