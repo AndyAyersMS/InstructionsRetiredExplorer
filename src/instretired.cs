@@ -42,7 +42,7 @@ namespace CoreClrInstRetired
         public bool IsJittedCode;
         public bool IsBackupImage;
         public long AssemblyId;
-        public int Flags;
+        public byte Flags;
 
         public ImageInfo(string name, ulong baseAddress, int size)
         {
@@ -288,7 +288,14 @@ namespace CoreClrInstRetired
                     {
                         JittedCodeSampleCount += counts;
 
-                        switch ((image.Flags >> 7) & 0x7)
+                        // Unknown,
+                        // MinOptJitted,
+                        // Optimized,
+                        // QuickJitted,
+                        // OptimizedTier1,
+                        // OptimizedTier1OSR,
+
+                        switch (image.Flags)
                         {
                             case 1: JitMinOptSampleCount += counts; break;
                             case 2: JitFullOptSampleCount += counts; break;
@@ -778,7 +785,7 @@ namespace CoreClrInstRetired
 
                                             methodInfo.IsJitGeneratedCode = true;
                                             methodInfo.IsJittedCode = loadUnloadData.IsJitted;
-                                            methodInfo.Flags = (int)loadUnloadData.PayloadByName("MethodFlags");
+                                            methodInfo.Flags = (byte) loadUnloadData.PayloadByName("OptimizationTier");
                                             methodInfo.AssemblyId = assemblyId;
 
                                             ImageMap.Add(key, methodInfo);
@@ -820,7 +827,7 @@ namespace CoreClrInstRetired
 
                                         methodInfo.IsJitGeneratedCode = true;
                                         methodInfo.IsJittedCode = loadUnloadData.IsJitted;
-                                        methodInfo.Flags = (int)loadUnloadData.PayloadByName("MethodFlags");
+                                        methodInfo.Flags = (byte) loadUnloadData.PayloadByName("OptimizationTied");
                                         methodInfo.AssemblyId = assemblyId;
 
                                         ImageMap.Add(key, methodInfo);
@@ -927,7 +934,7 @@ namespace CoreClrInstRetired
                     {
                         if (i.IsJittedCode)
                         {
-                            switch ((i.Flags >> 7) & 0x7)
+                            switch (i.Flags)
                             {
                                 case 1: codeDesc = "MinOpt "; break;
                                 case 2: codeDesc = "FullOpt"; break;
@@ -1038,21 +1045,31 @@ namespace CoreClrInstRetired
 
                 if (samplePattern != null)
                 {
+                    bool matched = false;
                     foreach (var i in ImageMap)
                     {
-                        if (i.Key.Contains(samplePattern))
+                        ImageInfo info = i.Value;
+                        if (info.Name.Contains(samplePattern))
                         {
-                            ImageInfo info = i.Value;
-                            Console.WriteLine("Raw samples for {info.Name} at 0x{info.BaseAddress:X16} -- 0x{info.EndAddress:X16} (length 0x{info.EndAddress - info.BaseAddress}:4X)");
-
+                            matched = true;
+                            bool first = true;
                             foreach (ulong address in SampleCountMap.Keys)
                             {
                                 if ((address >= info.BaseAddress) && (address <= info.EndAddress))
                                 {
-                                    Console.WriteLine("0x{address - info.BaseAddress:4X} : {SampleCountMap[address]}");
+                                    if (first)
+                                    {
+                                        Console.WriteLine($"Raw samples for {info.Name} at 0x{info.BaseAddress:X16} -- 0x{info.EndAddress:X16} (length 0x{(info.EndAddress - info.BaseAddress):X4})");
+                                        first = false;
+                                    }
+                                    Console.WriteLine($"0x{address - info.BaseAddress:X4} : {SampleCountMap[address] / PMCInterval}");
                                 }
                             }
                         }
+                    }
+                    if (!matched)
+                    {
+                        Console.WriteLine($"No images matched sample pattern `{samplePattern}'");
                     }
                 }
             }
